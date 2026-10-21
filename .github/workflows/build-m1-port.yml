@@ -10,9 +10,13 @@ permissions:
 
 jobs:
   package:
-    name: Build and package splash 1.4.0-m1.0 (Apple7/8)
-    runs-on: macos-26
+    name: Build and package splash 1.4.0-m1.0 (Apple7/8, ${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-26, xcode-27]
     steps:
       - uses: actions/checkout@v4
 
