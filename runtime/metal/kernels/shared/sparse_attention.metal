@@ -195,7 +195,7 @@ SPARSE_VERIFY_LOCATED_SPLIT(verify_attention_bf16_sparse_located_kv2_g12, 2, 12,
     constant SplashVerifyAttentionParams &lane = params[group.z];              \
     const uint kv_head = group.x % Heads, split = group.x / Heads;             \
     const SplashAttentionTile tile =                                           \
-        splash_verify_attention_tile<Heads, Group, SplashKvHeadDimension>(  \
+        splash_verify_attention_tile<Heads, Group, SPLASH_KV_HEAD_DIMENSION>(  \
             lane, kv_head, group.z);                                           \
     if (!tile.active || split >= tile.splits)                                  \
       return;                                                                  \
@@ -337,7 +337,7 @@ SPARSE_PREFILL_SPLIT(prefill_attention_bf16_sparse_kv2_g12, 2, 12, 256, bfloat)
       uint simd_lane [[thread_index_in_simdgroup]]) {                          \
     threadgroup q8sgf::SparseScratch<CacheElement> scratch;                    \
     const SplashAttentionTile tile = splash_prefill_attention_tile<            \
-        Heads, Group, SplashKvHeadDimension>(params, group.x, group.y);        \
+        Heads, Group, SPLASH_KV_HEAD_DIMENSION>(params, group.x, group.y);        \
     if (!tile.active || group.z >= tile.splits)                                \
       return;                                                                  \
     const SplashSparseList list = splash_sparse_list(                          \
