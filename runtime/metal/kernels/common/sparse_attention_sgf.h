@@ -30,7 +30,7 @@ template <typename CacheElement> struct SparseScratch {
 // [dimension][token]; tokens of a slot past the list's end are zero.
 template <uint KVHeads, typename CacheElement>
 inline void sparse_gather_values(threadgroup SparseScratch<CacheElement> &scratch,
-                                 const SplashKvAddressing<KVHeads, CacheElement> addressing,
+                                 const SplashKvAddressing<KVHeads, SplashKvHeadDimension, CacheElement> addressing,
                                  uint thread_index, uint threads) {
   constexpr uint D = SplashKvHeadDimension;
   constexpr uint PerChunk = 16 / sizeof(CacheElement);
@@ -106,7 +106,7 @@ __attribute__((always_inline)) inline void sparse_tile(
   for (uint d = 0; d < 32; ++d)
     output[d] = float2(0.0f);
   float2 row_max(-INFINITY), row_sum(0.0f);
-  const SplashKvAddressing<KVHeads, CacheElement> addressing(kv, kv_head);
+  const SplashKvAddressing<KVHeads, SplashKvHeadDimension, CacheElement> addressing(kv, kv_head);
 
   for (uint step = begin; step < end; step += kSparseSgfBlocks) {
     if (thread_index < kSparseSgfBlocks) {

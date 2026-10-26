@@ -135,8 +135,10 @@ template <> struct ValueRun<bfloat> {
 
 // One tile of eight query rows x G heads over its split's pages, as
 // splash_paged_attention_tile: row r of the tile sees committed_tokens + r + 1
-// tokens, and rows past active_rows repeat the last active row's mask.
-template <uint KVHeads, uint QueryHeadsPerKVHead, typename CacheElement>
+// tokens, and rows past active_rows repeat the last active row's mask. A
+// kernel compiled with a Window attends, for a row at position p, only the
+// keys p - Window to p (Window + 1 with its own; a sliding-window layer's).
+template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim, uint Window, typename CacheElement>
 __attribute__((always_inline)) inline void tile(
     device const bfloat *tile_queries, device const SplashKvPage *page_table,
     SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
@@ -147,15 +149,21 @@ __attribute__((always_inline)) inline void tile(
   constexpr uint Rows = 8;
   constexpr uint M = Rows * G;
   constexpr uint N = SplashKvPageTokens;
-  constexpr uint D = SplashKvHeadDimension;
-  static_assert(N == 32 && D == 256, "fragment maps assume Page32 and D = 256");
+  constexpr uint D = HeadDim;
+  constexpr uint Blocks = D / 64;
+  constexpr uint DimTiles = D / 8;
+  static_assert(N == 32 && (D == 128 || D == 256),
+                "fragment maps assume Page32 and D = 128 or 256");
   static_assert(SPLASH_TARGET_VERIFY_ROWS == Rows &&
                     SPLASH_PREFILL_ATTENTION_TILE_ROWS == Rows,
                 "one simdgroup per G fused rows of an eight-row tile");
   const uint visible = committed_tokens + active_rows;
   const uint pages = splash_attention_pages(visible);
-  const uint per_split = splash_attention_pages_per_split(pages, splits);
-  const uint page_begin = split * per_split;
+  const uint first_page = Window ? splash_attention_first_page<Window>(committed_tokens) : 0;
+  if (first_page >= pages)
+    return;
+  const uint per_split = splash_attention_pages_per_split(pages - first_page, splits);
+  const uint page_begin = first_page + split * per_split;
   if (page_begin >= pages)
     return;
   const uint page_end = min(pages, page_begin + per_split);
@@ -163,20 +171,27 @@ __attribute__((always_inline)) inline void tile(
   const uint fm = l.fm, fn = l.fn;
   // This lane's fused rows are row and row + 1, the columns of its fragments.
   const uint row = sg * 8 + fn;
-  const uint2 limit(
-      min(visible, committed_tokens + min(row / G, active_rows - 1) + 1),
-      min(visible, committed_tokens + min((row + 1) / G, active_rows - 1) + 1));
+  const uint2 causal_end(
+      committed_tokens + min(row / G, active_rows - 1) + 1,
+      committed_tokens + min((row + 1) / G, active_rows - 1) + 1);
+  // Each row's window start, and its limit counted from that start, so one
+  // unsigned comparison tests both ends: a token before start wraps past
+  // every limit.
+  const uint2 start(splash_attention_window_start<Window>(causal_end.x - 1),
+                    splash_attention_window_start<Window>(causal_end.y - 1));
+  const uint2 limit(min(visible, causal_end.x) - start.x,
+                    min(visible, causal_end.y) - start.y);
 
-  // Q^T fragments for all 32 QK steps, bfloat pairs (row, row + 1), staged
-  // in this lane's own threadgroup words (step-major, so lanes never share a
+  // Q^T fragments for all QK steps, bfloat pairs (row, row + 1), staged in
+  // this lane's own threadgroup words (step-major, so lanes never share a
   // bank) to keep them out of registers.
-  threadgroup uint *queries = query_stage + sg * 32 * 32;
+  threadgroup uint *queries = query_stage + sg * (Blocks * 8) * 32;
   {
     device const ushort *q0 =
         reinterpret_cast<device const ushort *>(tile_queries) + row * D;
     device const ushort *q1 = q0 + D;
 #pragma unroll
-    for (uint b = 0; b < 4; ++b)
+    for (uint b = 0; b < Blocks; ++b)
 #pragma unroll
       for (uint t = 0; t < 8; ++t) {
         const uint d = 64 * b + block_dimension(fm, t);
@@ -184,14 +199,14 @@ __attribute__((always_inline)) inline void tile(
       }
   }
   // O^T tiles: dimension 8 d + fm of rows (row, row + 1).
-  float2 output[32];
+  float2 output[DimTiles];
 #pragma unroll
-  for (uint d = 0; d < 32; ++d)
+  for (uint d = 0; d < DimTiles; ++d)
     output[d] = float2(0.0f);
   float2 row_max(-INFINITY), row_sum(0.0f);
   // The four tokens of this lane's score rows: base + {0, 1, 4, 5}.
   const uint scale_base = page_token(fm, 0);
-  const SplashKvAddressing<KVHeads, CacheElement> addressing(kv, kv_head);
+  const SplashKvAddressing<KVHeads, HeadDim, CacheElement> addressing(kv, kv_head);
 
   for (uint page = page_begin; page < page_end; ++page) {
     const SplashKvPageTensors<CacheElement> tensors = addressing.page(page_table[page]);
@@ -218,7 +233,7 @@ __attribute__((always_inline)) inline void tile(
     for (uint s = 0; s < 4; ++s)
       scores[s] = float2(0.0f);
 #pragma unroll
-    for (uint b = 0; b < 4; ++b)
+    for (uint b = 0; b < Blocks; ++b)
 #pragma unroll
       for (uint s = 0; s < 4; ++s) {
         KeyRun<CacheElement> run;
@@ -229,18 +244,20 @@ __attribute__((always_inline)) inline void tile(
       }
 
     // Online softmax, as splash_attention_page_softmax: key scale, then
-    // 1/sqrt(D); masked tokens never contribute, whatever their cache holds.
+    // 1/sqrt(HeadDim); masked tokens never contribute, whatever their cache
+    // holds.
     const uint token_start = page * N;
     float2 local_max(-INFINITY);
 #pragma unroll
     for (uint s = 0; s < 4; ++s) {
-      const uint token = token_start + page_token(fm, s);
+      const uint raw = token_start + page_token(fm, s);
+      const uint2 token(raw - start.x, raw - start.y);
       float2 score = scores[s];
       if constexpr (Quantized)
         score *= key_scale[s];
-      score *= 0.0625f;
-      scores[s] = float2(token < limit.x ? score.x : -INFINITY,
-                         token < limit.y ? score.y : -INFINITY);
+      score *= splash_attention_scale<HeadDim>();
+      scores[s] = float2(token.x < limit.x ? score.x : -INFINITY,
+                         token.y < limit.y ? score.y : -INFINITY);
       local_max = max(local_max, scores[s]);
     }
     // Lane bits 1, 2 and 4 select fm: the other 28 tokens of these rows.
@@ -252,10 +269,11 @@ __attribute__((always_inline)) inline void tile(
     float2 local_sum(0.0f);
 #pragma unroll
     for (uint s = 0; s < 4; ++s) {
-      const uint token = token_start + page_token(fm, s);
+      const uint raw = token_start + page_token(fm, s);
+      const uint2 token(raw - start.x, raw - start.y);
       probability[s] =
-          float2(token < limit.x ? fast::exp(scores[s].x - next_max.x) : 0.0f,
-                 token < limit.y ? fast::exp(scores[s].y - next_max.y) : 0.0f);
+          float2(token.x < limit.x ? fast::exp(scores[s].x - next_max.x) : 0.0f,
+                 token.y < limit.y ? fast::exp(scores[s].y - next_max.y) : 0.0f);
       local_sum += probability[s];
     }
     local_sum += simd_shuffle_xor(local_sum, 2);
@@ -270,17 +288,18 @@ __attribute__((always_inline)) inline void tile(
     row_max = next_max;
     if (simd_any(scale.x != 1.0f || scale.y != 1.0f)) {
 #pragma unroll
-      for (uint d = 0; d < 32; ++d)
+      for (uint d = 0; d < DimTiles; ++d)
         output[d] *= scale;
     }
     // P^T tile s is the score tile's own fragment: B[k = fm][n = fn].
     float2 weights[4];
 #pragma unroll
     for (uint s = 0; s < 4; ++s) {
-      const uint token = token_start + page_token(fm, s);
+      const uint raw = token_start + page_token(fm, s);
+      const uint2 token(raw - start.x, raw - start.y);
       weights[s] = float2(
-          token < limit.x ? float(bfloat(probability[s].x * value_scale[s])) : 0.0f,
-          token < limit.y ? float(bfloat(probability[s].y * value_scale[s])) : 0.0f);
+          token.x < limit.x ? float(bfloat(probability[s].x * value_scale[s])) : 0.0f,
+          token.y < limit.y ? float(bfloat(probability[s].y * value_scale[s])) : 0.0f);
     }
 
     // O^T tile d += V^T (dimensions 8 d + fm, tokens) x P^T, each output tile
@@ -289,7 +308,7 @@ __attribute__((always_inline)) inline void tile(
     // step index dynamic, which costs up to 10% in verify and 20% in BF16.
     device const CacheElement *value_row = values + fm * N + 4 * fn;
 #pragma unroll
-    for (uint d = 0; d < 32; ++d) {
+    for (uint d = 0; d < DimTiles; ++d) {
       ValueRun<CacheElement> run;
       run.load(value_row + d * 8 * N);
       mma(output[d], run.step(0), weights[0]);
@@ -301,7 +320,7 @@ __attribute__((always_inline)) inline void tile(
 
   device float *target = partials + slot * M * D;
 #pragma unroll
-  for (uint d = 0; d < 32; ++d) {
+  for (uint d = 0; d < DimTiles; ++d) {
     target[row * D + 8 * d + fm] = output[d].x;
     target[(row + 1) * D + 8 * d + fm] = output[d].y;
   }

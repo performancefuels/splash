@@ -3,6 +3,7 @@
 
 #include "HostKvExtents.hpp"
 #include "TestChecks.hpp"
+#include "TestFamilies.hpp"
 #include "ops/PagedAttention.hpp"
 #include "Q8PageFormatReference.hpp"
 
@@ -29,40 +30,78 @@ constexpr uint32_t kQueryStride = kStride;
 constexpr uint32_t kRows = kVerifyRows;
 static_assert(kStride == SPLASH_VERIFY_CHUNK_STRIDE);
 
-// The production GQA geometries. The group size selects the kernel
-// specialization; the suffix names its pipelines. The group of twelve runs
-// the sparse kernels, which attend through block lists, bound before their
-// parameters, and read token-major values. The register tile
-// (paged_attention_sgf.h, sparse_attention_sgf.h), which Apple7/8 run, takes
-// the same bindings and grids with 32 threads per fused-row group.
+// The production GQA geometries, every family's (TestFamilies.hpp), and the
+// Apple7/8 register tile's variants of them (paged_attention_sgf.h,
+// sparse_attention_sgf.h), which take 32 threads per fused-row group and one
+// threadgroup per KV head. The group size selects the kernel specialization,
+// which the plans name (ops::PagedAttention). A QSA family's group runs the
+// sparse kernels, which attend through block lists, bound before their
+// parameters, and read token-major values; a group of more than eight runs
+// each tile in parts, each a threadgroup of the split with partial slots of
+// its own (splash_attention_tile_part).
 struct Shape {
   uint32_t kvHeads;
   uint32_t queryHeadsPerKvHead;
-  const char *suffix;
+  bool tokenMajor = false;
   bool registerTile = false;
   uint32_t queryHeads() const { return kvHeads * queryHeadsPerKvHead; }
   uint32_t fusedRows() const { return kRows * queryHeadsPerKvHead; }
-  bool sparse() const { return queryHeadsPerKvHead == 12; }
+  bool sparse() const { return tokenMajor; }
+  uint32_t parts() const { return sparse() ? 1 : SPLASH_ATTENTION_TILE_PARTS(queryHeadsPerKvHead); }
+  // The partial of a fused row of the tile of KV head `head` from split
+  // `split` of `slotSplits`: [KV head][part][split][part's fused row].
+  uint64_t partialRow(uint32_t head, uint32_t slotSplits, uint32_t split, uint32_t row) const {
+    const uint32_t partRows = fusedRows() / parts();
+    return ((uint64_t{head} * parts() + row / partRows) * slotSplits + split) * partRows + row % partRows;
+  }
   Layout layout() const {
     return {.attentionLayers = 1, .kvHeads = kvHeads, .headDimension = kHeadDimension,
             .valuesTokenMajor = sparse()};
   }
-  // A phase's ("verify" or "prefill") split and reduce entries.
-  std::string split(const char *phase) const {
-    return std::string(phase) + (sparse() ? "_attention_q8_sparse" : "_attention_q8_split") +
-           (registerTile ? "_sgf" : "") + suffix;
+  // The tile the plans run: the register kernels on Apple7/8.
+  splash::ops::AttentionTile attentionTile() const {
+    return registerTile ? splash::ops::AttentionTile::Register : splash::ops::AttentionTile::Mpp;
   }
+  // A phase's ("verify" or "prefill") split and reduce entries, as its plans
+  // name them.
+  std::string split(std::string_view phase) const {
+    return phase == "verify" ? verifyPlan().splitPipeline : prefillPlan().splitPipeline;
+  }
+  std::string reduce(std::string_view phase) const {
+    return phase == "verify" ? verifyPlan().reducePipeline : prefillPlan().reducePipeline;
+  }
+  // The register tile runs one threadgroup per KV head of 32 x G threads.
   NSUInteger splitThreads() const { return registerTile ? 32 * queryHeadsPerKvHead : 256; }
-  std::string reduce(const char *phase) const {
-    return std::string(phase) + (sparse() ? "_attention_sparse_reduce" : "_attention_reduce") + suffix;
+  MTLSize verifySplitGroups(uint32_t splits, uint32_t width) const {
+    return sparse() ? MTLSizeMake(kvHeads * splits, 1, width)
+                    : MTLSizeMake(kvHeads * parts(), splits, width);
+  }
+  MTLSize prefillSplitGroups(uint32_t splits) const { return MTLSizeMake(kvHeads * parts(), 1, splits); }
+
+private:
+  splash::ops::PrefillAttentionPlan prefillPlan() const {
+    return splash::ops::PagedAttention::prefillPlan(kRows, queryHeads(), layout(), {}, attentionTile());
+  }
+  splash::ops::VerifyAttentionPlan verifyPlan() const {
+    const std::array<uint32_t, 1> history{0};
+    return splash::ops::PagedAttention::verifyPlan(1, queryHeads(), layout(), history, {}, attentionTile());
   }
 };
-constexpr std::array<Shape, 6> kShapes{{{4, 6, ""},
-                                        {2, 8, "_kv2_g8"},
-                                        {2, 12, "_kv2_g12"},
-                                        {4, 6, "", true},
-                                        {2, 8, "_kv2_g8", true},
-                                        {2, 12, "_kv2_g12", true}}};
+const std::vector<Shape> kShapes = [] {
+  std::vector<Shape> shapes;
+  for (const splash::test::AttentionGeometry &geometry : splash::test::familyAttentionGeometries()) {
+    Shape shape{geometry.kvHeads, geometry.queryHeads / geometry.kvHeads, geometry.valuesTokenMajor};
+    shapes.push_back(shape);
+    // The register tile's query stage is 32 KiB at a group of eight, and its
+    // sparse tile stages values instead; a group of sixteen is past the
+    // 32 KiB a threadgroup may use on Apple7/8.
+    if (shape.sparse() ? shape.queryHeadsPerKvHead <= 12 : shape.queryHeadsPerKvHead <= 8) {
+      shape.registerTile = true;
+      shapes.push_back(shape);
+    }
+  }
+  return shapes;
+}();
 
 using splash::test::require;
 
@@ -550,7 +589,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
     [encoder useResource:extent usage:MTLResourceUsageRead];
   // The sparse split's grid is one-dimensional (ops::PagedAttention::verifyPlan).
   [encoder dispatchThreadgroups:shape.sparse() ? MTLSizeMake(shape.kvHeads * splits, 1, width)
-                                               : MTLSizeMake(shape.kvHeads, splits, width)
+  [encoder dispatchThreadgroups:shape.verifySplitGroups(splits, width)
           threadsPerThreadgroup:MTLSizeMake(shape.splitThreads(), 1, 1)];
   [encoder setComputePipelineState:reduce];
   [encoder setBuffer:partials offset:0 atIndex:0];
@@ -603,7 +642,7 @@ Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
   [encoder setBytes:&params length:sizeof(params) atIndex:paramsIndex];
   for (id<MTLBuffer> extent : data.extents)
     [encoder useResource:extent usage:MTLResourceUsageRead];
-  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, 1, splits)
+  [encoder dispatchThreadgroups:shape.prefillSplitGroups(splits)
           threadsPerThreadgroup:MTLSizeMake(shape.splitThreads(), 1, 1)];
   [encoder setComputePipelineState:reduce];
   [encoder setBuffer:partials offset:0 atIndex:0];
@@ -819,7 +858,7 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   for (uint32_t head = 0; head < shape.kvHeads; ++head)
     for (uint32_t split = 0; split < splits; ++split)
       for (uint32_t row = 0; row < m; ++row) {
-        const uint64_t index = (uint64_t{head} * splits + split) * m + row;
+        const uint64_t index = shape.partialRow(head, splits, split, row);
         const bool active = row / shape.queryHeadsPerKvHead < activeRows;
         // Alternate underflow-scale differences and fractional exp weights.
         const float spacing = row % 2 ? 0.25f : 500.0f;
@@ -866,11 +905,11 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
         }
         double maximum = -INFINITY;
         for (uint32_t split = 0; split < splits; ++split)
-          maximum = std::max(maximum, double(t[((uint64_t{head} * splits + split) * m + row) * 2]));
+          maximum = std::max(maximum, double(t[shape.partialRow(head, splits, split, row) * 2]));
         for (uint32_t dim = 0; dim < d; ++dim) {
           double numerator = 0, denominator = 0;
           for (uint32_t split = 0; split < splits; ++split) {
-            const uint64_t index = (uint64_t{head} * splits + split) * m + row;
+            const uint64_t index = shape.partialRow(head, splits, split, row);
             const double weight = std::exp(double(t[index * 2]) - maximum);
             numerator += weight * p[index * d + dim];
             denominator += weight * t[index * 2 + 1];

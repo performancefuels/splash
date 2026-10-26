@@ -1,0 +1,62 @@
+name: Build M1/M2 1.4 port
+
+on:
+  push:
+    branches: [build/1.4.1-m1.0]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Build and package splash 1.4.1-m1.0 (Apple7/8, ${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-26, xcode-27]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Select newest Xcode and report tools
+        run: |
+          set -x
+          newest=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          sudo xcode-select -s "$newest"
+          xcodebuild -version
+          xcrun -sdk macosx metal --version || true
+          xcrun -sdk macosx metallib --version || true
+
+      - name: Download Metal toolchain component
+        continue-on-error: true
+        run: |
+          xcodebuild -downloadComponent MetalToolchain
+          xcrun -sdk macosx metal --version
+
+      - name: Build engine and metallib
+        run: make -j4 PYTHON_CANDIDATES=python3
+
+      - name: Engine tests (CPU)
+        run: make test-engine-cpu PYTHON_CANDIDATES=python3
+
+      - name: Python tests and lint
+        run: make check-python PYTHON_CANDIDATES=python3
+
+      - name: Package runtime archive
+        run: make package RELEASE_VERSION=1.4.1-m1.0 PYTHON_CANDIDATES=python3
+
+      - name: Show artefacts
+        run: ls -l dist && cat dist/*.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: splash-1.4.1-m1.0
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
