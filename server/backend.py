@@ -702,6 +702,18 @@ class NativeBackend:
         if job.thinking_token_budget is None:
             return None
         chat_format = job.chat_format
+        if chat_format.think_start_id is not None and not job.thinking:
+            if job.thinking_token_budget == 0:
+                return wire.ThinkingBudget(
+                    0,
+                    (chat_format.think_start_id, *(self.thinking_end or (chat_format.think_end_id,))),
+                    chat_format.think_end_id,
+                )
+            return wire.ThinkingBudget(
+                job.thinking_token_budget + 1,
+                self.thinking_end or (chat_format.think_end_id,),
+                chat_format.think_end_id,
+            )
         return wire.ThinkingBudget(
             job.thinking_token_budget,
             self.thinking_end or (chat_format.think_end_id,),

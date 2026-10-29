@@ -1090,7 +1090,11 @@ class Frontend:
             ),
             chat_format=self.chat_format,
             thinking_token_budget=(
-                budget if thinking and budget is not None and budget < max_new else None
+                budget
+                if (thinking or self.chat_format.think_start_id is not None)
+                and budget is not None
+                and budget + (1 if self.chat_format.think_start_id is not None and budget > 0 else 0) < max_new
+                else None
             ),
             thinking_display=thinking_display,
             tool_policy=tool_policy,
