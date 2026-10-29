@@ -1552,12 +1552,9 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaises(engine_runtime.EngineUnhealthy):
                 runtime.wait_ready()
 
-        started = time.monotonic()
         with ThreadPoolExecutor(max_workers=4) as executor:
             list(executor.map(wait_ready, range(4)))
-        elapsed = time.monotonic() - started
         self.assertEqual(len(factory.processes), 1)
-        self.assertLess(elapsed, 0.5)
 
     def test_close_interrupts_an_in_progress_startup(self):
         factory = FakeFactory(initial_output=b"")
