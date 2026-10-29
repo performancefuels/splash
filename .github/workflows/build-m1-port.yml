@@ -7,7 +7,7 @@ on:
         description: JSON array of isolated native variants
         required: true
         type: string
-        default: '["baseline","gateup","af5"]'
+        default: '["baseline","gateup","af5exact"]'
 
 permissions:
   contents: read
@@ -36,7 +36,7 @@ jobs:
           case "$VARIANT" in
             baseline) ;;
             gateup) git checkout "$GITHUB_SHA" -- runtime/ops/LinearGguf.cpp ;;
-            af5) git checkout "$GITHUB_SHA" -- runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal ;;
+            af5exact) git checkout "$GITHUB_SHA" -- runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal ;;
             *) echo "Unsupported variant: $VARIANT" >&2; exit 2 ;;
           esac
           printf '%s\n' "$GITHUB_SHA" "$VARIANT"

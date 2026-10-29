@@ -118,6 +118,12 @@ template <class F>
 inline vec<OperandType<F, true>, 2> operand_f32(typename F::Chunk ch, uint f, threadgroup const half2 *lut) {
   typedef Shape<F> S;
   if constexpr (F::Kind == QuantLinear) {
+    if constexpr (is_same_v<F, FmtAffine<5, 2>>) {
+      // Preserve the original half(128 + code) bits, without the half subtraction.
+      // The low nibble occupies mantissa bits 3-6; the fifth bit occupies bit 7.
+      const uint at = f == 0 ? ch.x << 3 : ch.x >> (4 * f - 3);
+      return as_type<half2>((at & 0x00780078u) | ((ch.y << (7 - 2 * f)) & 0x00800080u) | 0x58005800u);
+    }
     constexpr uint offset = S::Wide ? 0 : S::Seeded ? kZeroPointOffset - F::Zero : 128;
     return as_type<half2>(F::codes(ch)[f] | 0x64006400u) - half2(half(1024 - offset));
   } else if constexpr (F::Kind == QuantCodebook) {
@@ -140,10 +146,9 @@ inline vec<OperandType<F, true>, 2> operand_f32(typename F::Chunk ch, uint f, th
   }
 }
 
-// MLX affine whole spans whose F32 chains take the exact nibble operand.
+// MLX affine 4-bit over whole spans, whose F32 chains take nibble_operand.
 template <class F> struct NibbleSpan { static constexpr constant bool value = false; };
 template <uint Groups> struct NibbleSpan<FmtAffine<4, Groups>> { static constexpr constant bool value = Groups >= 2; };
-template <> struct NibbleSpan<FmtAffine<5, 2>> { static constexpr constant bool value = true; };
 // The exact half operand 1 + code / 64 of pair f of a 4-bit chunk word: the codes at bits 4-7 of each halfword
 // below half 1's bits, where pair 1's already sit, which takes a shift, a mask and an or per pair (operand_f32
 // adds a subtraction), and a span chain whose min part (64 s against codes to 15) is half operand_f32's.
