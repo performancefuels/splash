@@ -1108,7 +1108,13 @@ class Frontend:
                 budget
                 if (thinking or self.chat_format.think_start_id is not None)
                 and budget is not None
-                and budget + (1 if self.chat_format.think_start_id is not None and budget > 0 else 0) < max_new
+                and budget
+                + (
+                    1
+                    if self.chat_format.think_start_id is not None and budget > 0
+                    else 0
+                )
+                < max_new
                 else None
             ),
             thinking_display=thinking_display,
