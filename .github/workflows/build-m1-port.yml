@@ -1,26 +1,47 @@
-name: Build M1/M2 1.5 port
+name: Swift exactness-gated M2 experiments
 
 on:
-  push:
-    branches: [build/1.5.0-m1.0]
   workflow_dispatch:
     inputs:
-      run_checks:
-        description: Run tests after the active local session has concluded
-        required: false
-        type: boolean
-        default: false
+      variants:
+        description: JSON array of isolated native variants
+        required: true
+        type: string
+        default: '["baseline","gateup","af5"]'
 
 permissions:
   contents: read
 
 jobs:
   package:
-    name: Build and package splash 1.5.0-m1.0 (Apple7/8, xcode-27)
+    name: Swift ${{ matrix.variant }} (Apple7/8, xcode-27)
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON(inputs.variants) }}
     runs-on: xcode-27
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Select independent experimental change
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -eu
+          git checkout d0056d208b591776e3d76f32819b27ba358a0722 -- \
+            runtime/ops/LinearGguf.cpp \
+            runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal
+          case "$VARIANT" in
+            baseline) ;;
+            gateup) git checkout "$GITHUB_SHA" -- runtime/ops/LinearGguf.cpp ;;
+            af5) git checkout "$GITHUB_SHA" -- runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal ;;
+            *) echo "Unsupported variant: $VARIANT" >&2; exit 2 ;;
+          esac
+          printf '%s\n' "$GITHUB_SHA" "$VARIANT"
+          shasum -a 256 runtime/ops/LinearGguf.cpp \
+            runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal
 
       - uses: actions/setup-python@v5
         with:
@@ -41,44 +62,54 @@ jobs:
           xcodebuild -downloadComponent MetalToolchain
           xcrun -sdk macosx metal --version
 
-      - name: Build engine and metallib
-        run: make -j4 PYTHON_CANDIDATES=python3
+      - name: Build engine and existing parity tools
+        run: |
+          make -j4 PYTHON_CANDIDATES=python3 \
+            all build/engine-tests/decode-profile \
+            build/engine-tests/backend-benchmark \
+            build/engine-tests/teacher-logits \
+            build/engine-tests/weight-digests \
+            build/engine-tests/gguf-projection \
+            build/engine-tests/gguf-projection-benchmark \
+            build/engine-tests/linear-plan \
+            build/engine-tests/production-and-test.metallib
 
-      - name: Checksum compiled engine
-        working-directory: build
-        run: shasum -a 256 splash splash.metallib > SHA256SUMS
+      - name: Engine tests (CPU)
+        run: make test-engine-cpu PYTHON_CANDIDATES=python3
+
+      - name: Checksum native experiment
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          printf '%s\n' "$GITHUB_SHA" "$VARIANT" > build/VARIANT
+          shasum -a 256 build/splash build/splash.metallib \
+            build/host-step.metallib \
+            build/engine-tests/decode-profile \
+            build/engine-tests/backend-benchmark \
+            build/engine-tests/teacher-logits \
+            build/engine-tests/weight-digests \
+            build/engine-tests/gguf-projection \
+            build/engine-tests/gguf-projection-benchmark \
+            build/engine-tests/linear-plan \
+            build/engine-tests/production-and-test.metallib > build/SHA256SUMS
 
       - uses: actions/upload-artifact@v4
         with:
-          name: splash-1.5.0-m1.0-engine
+          name: swift-perf-${{ matrix.variant }}
           path: |
             build/splash
             build/splash.metallib
             build/host-step.metallib
             build/SHA256SUMS
+            build/VARIANT
+            build/engine-tests/decode-profile
+            build/engine-tests/backend-benchmark
+            build/engine-tests/teacher-logits
+            build/engine-tests/weight-digests
+            build/engine-tests/gguf-projection
+            build/engine-tests/gguf-projection-benchmark
+            build/engine-tests/linear-plan
+            build/engine-tests/production-and-test.metallib
           if-no-files-found: error
           retention-days: 7
 
-      - name: Engine tests (CPU)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_checks }}
-        run: make test-engine-cpu PYTHON_CANDIDATES=python3
-
-      - name: Python tests and lint
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_checks }}
-        run: make check-python PYTHON_CANDIDATES=python3
-
-      - name: Package runtime archive
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_checks }}
-        run: make package RELEASE_VERSION=1.5.0-m1.0 PYTHON_CANDIDATES=python3
-
-      - name: Show artefacts
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_checks }}
-        run: ls -l dist && cat dist/*.sha256
-
-      - uses: actions/upload-artifact@v4
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_checks }}
-        with:
-          name: splash-1.5.0-m1.0
-          path: dist/
-          if-no-files-found: error
-          retention-days: 7

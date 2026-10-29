@@ -140,9 +140,10 @@ inline vec<OperandType<F, true>, 2> operand_f32(typename F::Chunk ch, uint f, th
   }
 }
 
-// MLX affine 4-bit over whole spans, whose F32 chains take nibble_operand.
+// MLX affine whole spans whose F32 chains take the exact nibble operand.
 template <class F> struct NibbleSpan { static constexpr constant bool value = false; };
 template <uint Groups> struct NibbleSpan<FmtAffine<4, Groups>> { static constexpr constant bool value = Groups >= 2; };
+template <> struct NibbleSpan<FmtAffine<5, 2>> { static constexpr constant bool value = true; };
 // The exact half operand 1 + code / 64 of pair f of a 4-bit chunk word: the codes at bits 4-7 of each halfword
 // below half 1's bits, where pair 1's already sit, which takes a shift, a mask and an or per pair (operand_f32
 // adds a subtraction), and a span chain whose min part (64 s against codes to 15) is half operand_f32's.

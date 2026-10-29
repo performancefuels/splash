@@ -303,11 +303,15 @@ bool oneFormat(std::span<const Projection *const> projections) {
   return up.size() == 1 && gate.size() == 1 && !up.front().isFloat() && up.front().formatId == gate.front().formatId;
 }
 
-// Whether Apple7/8 decodes a gate/up pair in one pass on its register tile:
-// GGUF formats only; MLX affine formats (af4g64) keep two passes because
-// 17408x5120 regresses +2-4% at 3-4 lanes.
-bool apple7GateUpFormat(std::span<const Projection *const> projections) {
-  return oneFormat(projections) && !quant_affine_format(projections.front()->blocks().segments.front().formatId);
+// The existing register one-pass kernel is faster for the dense 27B's
+// affine gate/up at one or two lanes; keep its wider batches and other
+// affine shapes on the two-pass path.
+bool apple7GateUpFormat(LinearWorkload workload, std::span<const Projection *const> projections) {
+  if (!oneFormat(projections)) return false;
+  const uint32_t format = projections.front()->blocks().segments.front().formatId;
+  const auto [n, k] = workload.matrix;
+  return !quant_affine_format(format) ||
+         (format == GGUF_FMT_AF4G64 && n == 17408 && k == 5120 && workload.rows <= 2 * SPLASH_TARGET_VERIFY_ROWS);
 }
 
 // Whether Apple9 decodes a plan's projections (a gate/up plan's two) on the
@@ -513,8 +517,8 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
     // A gate/up pair of one format runs as one dispatch of both tensors' K
     // partitions, the last to arrive applying the gate: the 27B pair takes
     // 4-8% less time than as a gate pass and an up pass on an M2 Max.
-    // MLX affine formats (af4g64) keep two passes: 17408x5120 regresses +2-4% at 3-4 lanes.
-    config.oneGateUpPass = w.epilogue == LinearEpilogue::GateUp && apple7GateUpFormat(projections);
+    // Affine pairs use it only for the measured dense-27B shape at one/two lanes.
+    config.oneGateUpPass = w.epilogue == LinearEpilogue::GateUp && apple7GateUpFormat(w, projections);
     return config;
   }
   // Decode tiles walking K in lockstep all fetch the same slice of the input

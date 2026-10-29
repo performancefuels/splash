@@ -662,12 +662,12 @@ void ggufPlans() {
         }
       }
     }
-  // Apple7/8's register tile runs a gate/up pair of one format in one pass for GGUF formats;
-  // MLX af4g64 and pairs of two formats run two passes. The decode scratch bound covers the one pass.
+  // Apple7/8 gate/up scratch must cover both GGUF and affine plans at every batch width,
+  // whether the selected kernel uses one pass or two.
   for (const uint32_t cores : {8U, 32U, 38U}) {
     const Linear m1 = gpu(7, cores);
     for (const uint32_t n : {1024U, 17408U})
-      for (const uint32_t rows : {8U, 32U}) {
+      for (const uint32_t rows : {8U, 16U, 24U, 32U}) {
         const Projection up = blockProjection(n, 5120, 1, GGUF_FMT_Q4K), same = blockProjection(n, 5120, 1, GGUF_FMT_Q4K),
                          other = blockProjection(n, 5120, 1, GGUF_FMT_Q6K),
                          up_af4 = blockProjection(n, 5120, 1, GGUF_FMT_AF4G64),
@@ -677,12 +677,16 @@ void ggufPlans() {
                          af4 = m1.plan(gateUp, up_af4, &same_af4);
         const LinearConfig c = one.configuration();
         require(c.tile == LinearTile::GgufRegister && c.fp32Table && c.oneGateUpPass &&
-                    !two.configuration().oneGateUpPass && !af4.configuration().oneGateUpPass,
+                    !two.configuration().oneGateUpPass,
                 "Apple7/8 register gate/up pass default");
-        const LinearScratchSize bound = m1.decodeScratchSize({n, 5120}), need = one.scratchSize();
+        const LinearScratchSize bound = m1.decodeScratchSize({n, 5120}), need = one.scratchSize(),
+                                affineNeed = af4.scratchSize();
         require(need.partials == uint64_t{2} * c.splits * rows * n * 4 && need.counters == n / 32 * 4 &&
                     bound.partials >= need.partials && bound.counters >= need.counters,
                 "Apple7/8 one-pass gate/up scratch");
+        require(bound.input >= affineNeed.input && bound.sums >= affineNeed.sums &&
+                    bound.partials >= affineNeed.partials && bound.counters >= affineNeed.counters,
+                "Apple7/8 affine gate/up stays within its decode scratch bound");
       }
   }
   // The 27B's pair, 17408 x 5120 in MLX 4-bit, runs in one pass where its 544 one-pass threadgroups fill whole waves
