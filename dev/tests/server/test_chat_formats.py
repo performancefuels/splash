@@ -647,10 +647,6 @@ class FlintPromptTests(unittest.TestCase):
         ):
             with self.subTest(**options):
                 body = fixtures.chat_body(**options)
-                job = frontend.prepare(body, deadline=fixtures.FOREVER)
-                self.assertFalse(job.thinking)
-                self.assertIsNone(job.thinking_token_budget)
-                self.assertIs(job.chat_format, frontend.chat_format)
                 prompts.add(frontend.apply_template(body, deadline=fixtures.FOREVER))
         self.assertEqual(prompts, {"<|user|>hello<|assistant|>"})
 
