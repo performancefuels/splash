@@ -671,8 +671,8 @@ void oneGateUpPass(MetalBackend &backend, const Linear &linear, bool spread) {
 }
 
 // Gate/up in one pass on Apple7/8's register tile (LinearConfig::oneGateUpPass with fp32Table): every format it takes
-// at [768, 2048], 1-4 lanes, and Q4_K and MLX 4-bit at the 27B's [17408, 5120], 1 and 4 lanes, at every K split the
-// tile takes, bitwise the gate and up passes, whatever the partials held before. `linear` is Apple7/8's.
+// at [768, 2048], 1-4 lanes, and at the 27B's [17408, 5120], Q4_K at 1 and 4 lanes and
+// MLX 4-bit at every lane count, at every K split, bitwise the two passes. `linear` is Apple7/8's.
 void registerOneGateUpPass(MetalBackend &backend, const Linear &linear) {
   uint32_t mostSplits = 1;
   const auto pairs = [&](Fmt f, uint32_t N, uint32_t K, uint32_t columns, std::span<const uint32_t> lanes) {
@@ -700,10 +700,11 @@ void registerOneGateUpPass(MetalBackend &backend, const Linear &linear) {
   constexpr uint32_t kAllLanes[] = {1, 2, 3, 4}, kEndLanes[] = {1, kMaximumLanes};
   const std::vector<Fmt> formats = tileFormats(LinearTile::GgufRegister);
   for (const Fmt f : formats) pairs(f, 768, decodeInputs(false), 768 + kPadding, kAllLanes);
-  for (const Fmt f : {Q4K, Fmt(GGUF_FMT_AF4G64)}) pairs(f, 17408, 5120, 17408, kEndLanes);
+  pairs(Q4K, 17408, 5120, 17408, kEndLanes);
+  pairs(Fmt(GGUF_FMT_AF4G64), 17408, 5120, 17408, kAllLanes);
   section("register one-pass gate/up (Apple7/8): " + std::to_string(formats.size()) + " formats at 768x" +
-          std::to_string(decodeInputs(false)) + ", 1-4 lanes, and Q4_K and MLX 4-bit at 17408x5120, 1 and 4 lanes, S 1-" +
-          std::to_string(mostSplits) + ", bitwise the two passes");
+          std::to_string(decodeInputs(false)) + ", 1-4 lanes, and at 17408x5120 Q4_K at 1/4 lanes and MLX 4-bit at "
+          "1-4 lanes, S 1-" + std::to_string(mostSplits) + ", bitwise the two passes");
 }
 
 // ---------------------------------------------------------------- prefill
