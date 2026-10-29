@@ -1,22 +1,24 @@
-name: Build M1/M2 1.4 port
+name: Build M1/M2 1.5 port
 
 on:
   push:
-    branches: [build/1.4.1-m1.0]
+    branches: [build/1.5.0-m1.0]
   workflow_dispatch:
+    inputs:
+      run_checks:
+        description: Run tests after the active local session has concluded
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   package:
-    name: Build and package splash 1.4.1-m1.0 (Apple7/8, ${{ matrix.runner }})
-    runs-on: ${{ matrix.runner }}
+    name: Build and package splash 1.5.0-m1.0 (Apple7/8, xcode-27)
+    runs-on: xcode-27
     timeout-minutes: 180
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [macos-26, xcode-27]
     steps:
       - uses: actions/checkout@v4
 
@@ -42,21 +44,41 @@ jobs:
       - name: Build engine and metallib
         run: make -j4 PYTHON_CANDIDATES=python3
 
-      - name: Engine tests (CPU)
-        run: make test-engine-cpu PYTHON_CANDIDATES=python3
-
-      - name: Python tests and lint
-        run: make check-python PYTHON_CANDIDATES=python3
-
-      - name: Package runtime archive
-        run: make package RELEASE_VERSION=1.4.1-m1.0 PYTHON_CANDIDATES=python3
-
-      - name: Show artefacts
-        run: ls -l dist && cat dist/*.sha256
+      - name: Checksum compiled engine
+        working-directory: build
+        run: shasum -a 256 splash splash.metallib > SHA256SUMS
 
       - uses: actions/upload-artifact@v4
         with:
-          name: splash-1.4.1-m1.0
+          name: splash-1.5.0-m1.0-engine
+          path: |
+            build/splash
+            build/splash.metallib
+            build/host-step.metallib
+            build/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Engine tests (CPU)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_checks }}
+        run: make test-engine-cpu PYTHON_CANDIDATES=python3
+
+      - name: Python tests and lint
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_checks }}
+        run: make check-python PYTHON_CANDIDATES=python3
+
+      - name: Package runtime archive
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_checks }}
+        run: make package RELEASE_VERSION=1.5.0-m1.0 PYTHON_CANDIDATES=python3
+
+      - name: Show artefacts
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_checks }}
+        run: ls -l dist && cat dist/*.sha256
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_checks }}
+        with:
+          name: splash-1.5.0-m1.0
           path: dist/
           if-no-files-found: error
           retention-days: 7

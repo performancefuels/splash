@@ -4,13 +4,19 @@
 // - weights enter the MMA as exact bf16: 128 + code for linear codes with a
 //   min, 160 + code - zero for seeded linear codes (one add), the code itself
 //   (converted) for 8-bit linear codes, or the codebook, int8 or grid value;
-// - one MMA chain per coefficient group, closed by the fp32 epilogue
-//   s * chain + b * sum (b = m - 128 s, formats with a min per 32 inputs, or
-//   b = m for 8-bit codes) or
-//   s * chain with the chain seeded by -160 * sum from the table (formats
-//   with a zero point, and Q2_K, whose min per 16 inputs adds b * seed with
-//   b = m / -160);
-// - coefficients decoded once per simdgroup into threadgroup memory;
+// - one MMA chain per 32 inputs (per 16 for 16-input scales), closed by the
+//   fp32 epilogue s * chain; a format with a min adds b * sum once per
+//   coefficient group, the F::Group inputs one scale and min cover (16, 32,
+//   or 64 to 256 where the groups of a meta unit share them, as MLX affine's
+//   groups of 64 and 128 do), but at least once per 64-input span of the
+//   table, with the last chain of either (b = m - 128 s, or b = m for 8-bit
+//   codes; sum those inputs, from the span's sums of 32), so that it reads
+//   the current span alone; with a zero point, that chain starts from
+//   -160 * sum instead (the operand being 160 + code - zero), the table's
+//   seed of 16 inputs for 16-input scales, and Q2_K's min per 16 inputs adds
+//   b * seed with b = m / -160;
+// - coefficients decoded once per simdgroup and coefficient group into
+//   threadgroup memory;
 // - L request lanes per threadgroup share the weight operands and coefficients;
 //   each lane's chains and epilogue run as with L = 1, so its result does not
 //   depend on the batch width.
@@ -52,19 +58,22 @@ template <class F> struct Shape {
     HasMin = Linear && F::Zero == 0,                          // Q4_K, Q5_K, Q4_1, Q5_1, Q2_K, MLX affine: s code + m
     // Linear codes past 127 (MLX affine 8-bit), which enter the MMA as the code itself: no bf16 128 + code holds them
     Wide = QuantWideCodes<F>::value,
-    // Linear codes chained from the table's seed of their 16 inputs: s (code - zero) with a zero point (Q6_K, Q3_K,
-    // Q4_0, Q5_0, IQ1, PQ2_0, Q2_0), and Q2_K's min per 16 inputs
+    // Linear codes whose chains start from -160 times the sum of their inputs, so that 160 + code - zero enters the
+    // MMA: s (code - zero) with a zero point, once per coefficient group and span from the table's sums of 32 where a
+    // scale covers 32 inputs or more (Q4_0, Q5_0, IQ1_S, PQ2_0, Q2_0) and per 16-input chain from the table's seeds
+    // (Q6_K, Q3_K, IQ1_M); and Q2_K's min per 16 inputs
     Seeded = Linear && (!HasMin || F::Group == 16),
     // bf16 bits of the operand of code 0: 128, or 160 - zero when seeded
     Operand = 0x4300 + (Seeded ? kZeroPointOffset - 128 - F::Zero : 0),
-    CG = Seeded || F::Group == 16 ? 2 : 1,                    // coefficient groups per 32 inputs
-    // One coefficient over each 64-input span (MLX affine in groups of 64 or 128), whose chain the F32 instances
-    // run over the whole span, closing it once
+    CG = F::Group == 16 ? 2 : 1,                              // MMA chains per 32 inputs
+    CPG = CG * F::Group / 32,                                 // chains per coefficient group
+    MinChains = CPG < 2 * CG ? CPG : 2 * CG,                  // chains per term: the group's, at most a span's
+    // Apple7/8's F32 instances close MLX affine groups of 64 or 128 once per span.
     SpanChain = SpanCoefficients<F>::value,
     // Spans decoded per coefficient unit: every span of eight groups (one meta unit of eight, or two of four), or
     // half of them where a span's coefficients take twice Q4_K's storage (Q2_K's (s, b) per 16 inputs)
     UnitSpans = F::MetaGroups == 1 ? 1 : CG * (HasMin ? 2 : 1) <= 2 ? 4 : 2,
-    J = 2 * UnitSpans * CG,                                   // coefficients per column and unit
+    J = 2 * UnitSpans * CG / CPG,                             // coefficients per column and unit
   };
   // Each coefficient reads its own group's meta unit (coefficient_source), so a unit of two or four groups (MLX
   // affine's 64 or 128 elements, PQ2_0's 128, Q2_0's 64) splits a coefficient unit of four spans: such a format takes
@@ -73,7 +82,15 @@ template <class F> struct Shape {
                 "a meta unit is one, two, four or eight groups");
   static_assert(UnitSpans * GGUF_TABLE16_SPAN_INPUTS == quant_register_unit(F::Id),
                 "the host splits K in the coefficient units of quant_register_unit");
-  static_assert(!Wide || (HasMin && !Seeded), "wide codes have a min per 32 inputs");
+  static_assert(!Wide || (HasMin && !Seeded), "wide codes have a min per group");
+  static_assert(F::Group == 16 || (F::Group % 32 == 0 && F::Group <= 32 * F::MetaGroups),
+                "a coefficient covers 16 inputs, or whole groups of one meta unit");
+  static_assert(CPG >= 1 && 2 * UnitSpans * CG % CPG == 0, "a coefficient unit holds whole coefficient groups");
+  // decode adds a min term with its last chain, or starts that chain from a zero point's, from the span's 32-input
+  // sums of the term's chains: a chain covers one 32-input group, and a term's chains lie in one span, so it reads
+  // no sum before the span.
+  static_assert(!(HasMin && !Seeded) || CG == 1, "a min term's chains are 32-input groups");
+  static_assert(2 * CG % MinChains == 0, "a min term's chains lie in one span");
 };
 template <class F> using Coef = metal::conditional_t<Shape<F>::HasMin != 0, float2, float>;
 // The coefficients of a threadgroup's simdgroups for one unit; the run-time-format kernels hold every format's in
@@ -242,8 +259,8 @@ inline bfloat2 operand(typename F::Chunk ch, uint f, threadgroup const bfloat2 *
 }
 
 // What coefficient j of a column in coefficient unit u is decoded from: its
-// meta unit and, with ScaleInChunk, chunk 0 of its group (which holds the
-// scale).
+// meta unit and, with ScaleInChunk, chunk 0 of its first group (which holds
+// the scale).
 template <class F> struct CoefSource {
   typename F::Meta meta;
   typename F::Chunk chunk;
@@ -252,7 +269,7 @@ template <class F>
 inline CoefSource<F> coefficient_source(device uchar *w0, device uchar *w1, device uchar *meta, uint plane_tile,
                                         uint groups, uint column, uint u, uint j) {
   typedef Shape<F> S;
-  const uint g = u * 2 * S::UnitSpans + j / S::CG;
+  const uint g = u * 2 * S::UnitSpans + j * S::CPG / S::CG;   // its first chain's 32-input group
   const uint units = groups / F::MetaGroups;
   CoefSource<F> src;
   src.meta = F::loadMeta(meta + ((ulong(plane_tile) * units + g / F::MetaGroups) * QUANT_TILE_ROWS + column) * F::MetaBytes);
@@ -262,13 +279,14 @@ inline CoefSource<F> coefficient_source(device uchar *w0, device uchar *w1, devi
   }
   return src;
 }
-// Coefficient j of a column in coefficient unit u: group gi = j / CG of the
-// unit, 16-group half h = j % CG. Formats with a min return (s, m - 128 s),
-// (s, m) with wide codes, or with a seeded min (s, m / -160), whose product
-// with the seed is m times the sum of the inputs.
+// Coefficient j of a column in coefficient unit u, that of its first chain c =
+// j CPG: 32-input group c / CG of the unit, and of 16-input coefficients half
+// h = c % CG. Formats with a min return (s, m - 128 s), (s, m) with wide
+// codes, or with a seeded min (s, m / -160), whose product with the seed is m
+// times the sum of the inputs.
 template <class F> inline Coef<F> coefficient(CoefSource<F> src, uint u, uint j) {
   typedef Shape<F> S;
-  const uint g = u * 2 * S::UnitSpans + j / S::CG, h = j % S::CG;
+  const uint g = u * 2 * S::UnitSpans + j * S::CPG / S::CG, h = j * S::CPG % S::CG;
   QuantCoef k;
   if constexpr (F::ScaleInChunk) k = F::coef(src.meta, src.chunk);
   else k = F::coef(src.meta, ushort(g % F::MetaGroups));
@@ -291,7 +309,7 @@ inline void decode(device const TableElem<F32> *table, device const float *sums,
                    threadgroup uint *arrival) {
   typedef Shape<F> S;
   typedef Coef<F> C;
-  constexpr uint FG = 4 / S::CG;  // fragments per coefficient group
+  constexpr uint FG = 4 / S::CG;  // fragments per chain
   const uint K = p.input_size, spans = K / GGUF_TABLE16_SPAN_INPUTS, groups = K / 32, splits = p.splits;
   const ulong tileSums = table16_sums_per_tile(K);
   const uint units = spans / S::UnitSpans;
@@ -336,32 +354,30 @@ inline void decode(device const TableElem<F32> *table, device const float *sums,
   for (uint u = u0; u < u1; ++u) {
     // This unit's coefficients for the simdgroup's NC columns, each decoded
     // once. Every source load is issued before the first decode waits for one,
-    // which takes 1-8% off the zero-point formats (16 coefficients per column
-    // and unit) at one to four lanes on the 40-core M3 Max.
-    // The F32 span chains read one coefficient per span, every other one of the unit's, and decode those alone: on an
-    // M2 Max, 2.4-2.8% off MLX 4-bit's 27B projections at one lane and 0.7-1.6% at two to four.
-    constexpr uint JS = F32 && S::SpanChain ? 2 : 1;
-    constexpr uint I = (NC * S::J / JS + 31) / 32;
+    // which takes 1-8% off the zero-point formats of 16-input scales (16
+    // coefficients per column and unit) at one to four lanes on the 40-core
+    // M3 Max. F32 span chains share these coefficients by CPG too.
+    constexpr uint I = (NC * S::J + 31) / 32;
     CoefSource<F> src[I];
 #pragma unroll
     for (uint i = 0; i < I; ++i) {
       const uint e = lane + 32 * i;
-      if (e < NC * S::J / JS)
-        src[i] = coefficient_source<F>(w0, w1, meta, plane_tile, groups, plane_row + e % NC, u, JS * (e / NC));
+      if (e < NC * S::J)
+        src[i] = coefficient_source<F>(w0, w1, meta, plane_tile, groups, plane_row + e % NC, u, e / NC);
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
     for (uint i = 0; i < I; ++i) {
       const uint e = lane + 32 * i;
-      if (e < NC * S::J / JS) {
-        C k = coefficient<F>(src[i], u, JS * (e / NC));
+      if (e < NC * S::J) {
+        C k = coefficient<F>(src[i], u, e / NC);
         // The F32 per-32 nibble chains' epilogue factors, 64 s and m - 64 s (code = 64 (operand - 1)), once per
         // coefficient rather than per chain: on an M2 Max, 1-2% off Q4_K's, Q4_0's and Q5_K's 27B projections at one to
         // three lanes (Q4_K and Q4_0 0.3% more at four).
         if constexpr (F32 && NibbleChunk<F>::value) k = float2(64 * k.x, fma(64.0f, k.x, k.y));
         // The centered chains' Scale s.
         if constexpr (F32 && CenteredChunk<F>::value) k = CenteredChunk<F>::Scale * k;
-        cu[JS * (e / NC) * NC + e % NC] = k;
+        cu[(e / NC) * NC + e % NC] = k;
       }
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -403,7 +419,7 @@ inline void decode(device const TableElem<F32> *table, device const float *sums,
         }
         C cs[2];
 #pragma unroll
-        for (uint nf = 0; nf < 2; ++nf) cs[nf] = cu[us * 2 * NC + nf * 8 + fm];
+        for (uint nf = 0; nf < 2; ++nf) cs[nf] = cu[(us * 2) / S::CPG * NC + nf * 8 + fm];
 #pragma unroll
         for (uint r = 0; r < L; ++r) {
           device const float *rs = s32 + ulong(r) * tileSums + fn;
@@ -439,8 +455,10 @@ inline void decode(device const TableElem<F32> *table, device const float *sums,
             else a[nf][f] = operand<F>(cur[nf][q], f, lut);
           }
 #pragma unroll
-          for (uint h = 0; h < S::CG; ++h) cs[h][nf] = cu[((us * 2 + q) * S::CG + h) * NC + nf * 8 + fm];
+          for (uint h = 0; h < S::CG; ++h) cs[h][nf] = cu[((us * 2 + q) * S::CG + h) / S::CPG * NC + nf * 8 + fm];
         }
+        // Whether this 32-input group of the table closes a term's inputs, a coefficient group or its span.
+        const bool closes = ((us * 2 + q) * S::CG + S::CG) % S::MinChains == 0;
 #pragma unroll
         for (uint r = 0; r < L; ++r) {
           const vec<T, 8> bq = xt[ulong(r) * K + (8 * q + fm) * 4 + c];
@@ -448,11 +466,20 @@ inline void decode(device const TableElem<F32> *table, device const float *sums,
 #pragma unroll
           for (uint f = 0; f < 4; ++f) b[f] = reinterpret_cast<thread const vec<T, 2> *>(&bq)[f];
           float2 sum = float2(0), seed[S::CG];
-          if (S::HasMin && !S::Seeded) sum = *(device const float2 *)(s32 + ulong(r) * tileSums + q * 8 + fn);
+          if ((S::HasMin || S::Seeded) && S::CG == 1 && closes) {
+            // The sum of the term's inputs: this 32-input sum and, closing a term of 64 inputs, the span's other.
+            sum = *(device const float2 *)(s32 + ulong(r) * tileSums + q * 8 + fn);
 #pragma unroll
-          for (uint h = 0; h < S::CG; ++h)
-            seed[h] = S::Seeded && !centered ? *(device const float2 *)(seeds + ulong(r) * tileSums + (2 * q + h) * 8 + fn)
-                                : float2(0);
+            for (uint t = 1; t < S::MinChains; ++t) {
+              const int earlier = int(q) - int(t);   // an earlier 32-input group of the span
+              sum += *(device const float2 *)(s32 + ulong(r) * tileSums + fn + earlier * 8);
+            }
+          }
+#pragma unroll
+          for (uint h = 0; h < S::CG; ++h)   // a 16-input chain's seed from the table, a term's once from its sum
+            seed[h] = !S::Seeded || centered ? float2(0)
+                      : S::CG == 2 ? *(device const float2 *)(seeds + ulong(r) * tileSums + (2 * q + h) * 8 + fn)
+                                   : -float(kZeroPointOffset) * sum;
 #pragma unroll
           for (uint h = 0; h < S::CG; ++h) {
 #pragma unroll
@@ -467,7 +494,7 @@ inline void decode(device const TableElem<F32> *table, device const float *sums,
                 acc[r][nf] = fma(sum, cs[h][nf].y, acc[r][nf]);
               } else if constexpr (S::HasMin) {
                 acc[r][nf] = fma(dot, cs[h][nf].x, acc[r][nf]);
-                acc[r][nf] = fma(S::Seeded ? seed[h] : sum, cs[h][nf].y, acc[r][nf]);
+                if (S::Seeded || closes) acc[r][nf] = fma(S::Seeded ? seed[h] : sum, cs[h][nf].y, acc[r][nf]);
               } else if constexpr (centered) {
                 // code - zero = Scale operand, the coefficient being Scale s.
                 acc[r][nf] = fma(dot, float(cs[h][nf]), acc[r][nf]);
@@ -541,7 +568,7 @@ inline void decode_fragment_paired(device const TableElem<F32> *table, device co
                                    threadgroup Coef<F> *coefs, threadgroup uint *arrival) {
   typedef Shape<F> S;
   typedef Coef<F> C;
-  constexpr uint FG = 4 / S::CG;  // fragments per coefficient group
+  constexpr uint FG = 4 / S::CG;  // fragments per chain
   const uint K = p.input_size, spans = K / GGUF_TABLE16_SPAN_INPUTS, groups = K / 32, splits = p.splits;
   const ulong tileSums = table16_sums_per_tile(K);
   const uint units = spans / S::UnitSpans;
@@ -577,30 +604,29 @@ inline void decode_fragment_paired(device const TableElem<F32> *table, device co
   for (uint r = 0; r < L; ++r) acc[r][0] = acc[r][1] = float2(0);
   load(cur);
   for (uint u = u0_split; u < u1_split; ++u) {
-    constexpr uint JS = F32 && S::SpanChain ? 2 : 1;
-    constexpr uint I = (NC * S::J / JS + 31) / 32;
+    constexpr uint I = (NC * S::J + 31) / 32;
     CoefSource<F> src[I];
 #pragma unroll
     for (uint i = 0; i < I; ++i) {
       const uint e = lane + 32 * i;
-      if (e < NC * S::J / JS) {
+      if (e < NC * S::J) {
         const bool is_up = (e % NC) >= 8;
         device uchar *mw0 = is_up ? u0 : g0;
         device uchar *mw1 = is_up ? u1 : g1;
         device uchar *mm = is_up ? um : gm;
         const uint col = plane_row + (is_up ? (e % NC - 8) : (e % NC));
-        src[i] = coefficient_source<F>(mw0, mw1, mm, plane_tile, groups, col, u, JS * (e / NC));
+        src[i] = coefficient_source<F>(mw0, mw1, mm, plane_tile, groups, col, u, e / NC);
       }
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
     for (uint i = 0; i < I; ++i) {
       const uint e = lane + 32 * i;
-      if (e < NC * S::J / JS) {
-        C k = coefficient<F>(src[i], u, JS * (e / NC));
+      if (e < NC * S::J) {
+        C k = coefficient<F>(src[i], u, e / NC);
         if constexpr (F32 && NibbleChunk<F>::value) k = float2(64 * k.x, fma(64.0f, k.x, k.y));
         if constexpr (F32 && CenteredChunk<F>::value) k = CenteredChunk<F>::Scale * k;
-        cu[JS * (e / NC) * NC + e % NC] = k;
+        cu[(e / NC) * NC + e % NC] = k;
       }
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -642,7 +668,7 @@ inline void decode_fragment_paired(device const TableElem<F32> *table, device co
         }
         C cs[2];
 #pragma unroll
-        for (uint nf = 0; nf < 2; ++nf) cs[nf] = cu[us * 2 * NC + nf * 8 + fm];
+        for (uint nf = 0; nf < 2; ++nf) cs[nf] = cu[(us * 2) / S::CPG * NC + nf * 8 + fm];
 #pragma unroll
         for (uint r = 0; r < L; ++r) {
           device const float *rs = s32 + ulong(r) * tileSums + fn;
@@ -677,8 +703,10 @@ inline void decode_fragment_paired(device const TableElem<F32> *table, device co
             else a[nf][f] = operand<F>(cur[nf][q], f, lut);
           }
 #pragma unroll
-          for (uint h = 0; h < S::CG; ++h) cs[h][nf] = cu[((us * 2 + q) * S::CG + h) * NC + nf * 8 + fm];
+          for (uint h = 0; h < S::CG; ++h) cs[h][nf] = cu[((us * 2 + q) * S::CG + h) / S::CPG * NC + nf * 8 + fm];
         }
+        // Whether this 32-input group closes a coefficient group's or span's min/zero-point term.
+        const bool closes = ((us * 2 + q) * S::CG + S::CG) % S::MinChains == 0;
 #pragma unroll
         for (uint r = 0; r < L; ++r) {
           const vec<T, 8> bq = xt[ulong(r) * K + (8 * q + fm) * 4 + c];
@@ -686,11 +714,19 @@ inline void decode_fragment_paired(device const TableElem<F32> *table, device co
 #pragma unroll
           for (uint f = 0; f < 4; ++f) b[f] = reinterpret_cast<thread const vec<T, 2> *>(&bq)[f];
           float2 sum = float2(0), seed[S::CG];
-          if (S::HasMin && !S::Seeded) sum = *(device const float2 *)(s32 + ulong(r) * tileSums + q * 8 + fn);
+          if ((S::HasMin || S::Seeded) && S::CG == 1 && closes) {
+            sum = *(device const float2 *)(s32 + ulong(r) * tileSums + q * 8 + fn);
+#pragma unroll
+            for (uint t = 1; t < S::MinChains; ++t) {
+              const int earlier = int(q) - int(t);
+              sum += *(device const float2 *)(s32 + ulong(r) * tileSums + fn + earlier * 8);
+            }
+          }
 #pragma unroll
           for (uint h = 0; h < S::CG; ++h)
-            seed[h] = S::Seeded && !centered ? *(device const float2 *)(seeds + ulong(r) * tileSums + (2 * q + h) * 8 + fn)
-                                : float2(0);
+            seed[h] = !S::Seeded || centered ? float2(0)
+                      : S::CG == 2 ? *(device const float2 *)(seeds + ulong(r) * tileSums + (2 * q + h) * 8 + fn)
+                                   : -float(kZeroPointOffset) * sum;
 #pragma unroll
           for (uint h = 0; h < S::CG; ++h) {
 #pragma unroll
@@ -704,7 +740,7 @@ inline void decode_fragment_paired(device const TableElem<F32> *table, device co
                 acc[r][nf] = fma(sum, cs[h][nf].y, acc[r][nf]);
               } else if constexpr (S::HasMin) {
                 acc[r][nf] = fma(dot, cs[h][nf].x, acc[r][nf]);
-                acc[r][nf] = fma(S::Seeded ? seed[h] : sum, cs[h][nf].y, acc[r][nf]);
+                if (S::Seeded || closes) acc[r][nf] = fma(S::Seeded ? seed[h] : sum, cs[h][nf].y, acc[r][nf]);
               } else if constexpr (centered) {
                 acc[r][nf] = fma(dot, float(cs[h][nf]), acc[r][nf]);
               } else {
