@@ -358,6 +358,15 @@ class StreamingToolCallProjector:
         name = name.strip(NAME_SPACE)
         if not name:
             return
+        if self.tool_types is not None:
+            schemas = self.tool_types._policy.schemas
+            if name not in schemas and "." in name:
+                tail = name.rsplit(".", 1)[-1]
+                head = name.split(".", 1)[0]
+                if tail in schemas:
+                    name = tail
+                elif head in schemas:
+                    name = head
         if not self.streamed_count:
             # Whitespace before the first text only framed the calls.
             self.content_fragments.clear()
