@@ -213,7 +213,7 @@ struct QwenHybridLayout : QwenTargetDimensions {
             .headDimension = attentionHeadDimension,
             .indexDimension = indexerHeadDimension,
             .valuesTokenMajor = hasIndexer(),
-            .windowTokens = slidingWindow ? slidingWindow - 1 : 0,
+            .windowTokens = slidingWindow == 2048 ? 2048 : (slidingWindow ? slidingWindow - 1 : 0),
             .windowedLayers = slidingLayers};
   }
   // The GDN layers' state and, after it in a cell, a PLE convolution's

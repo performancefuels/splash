@@ -432,14 +432,15 @@ def _validate_processor(config):
     two temporal slices, merged 2x2 and normalized to [-1, 1]. A processor
     configuration asking for another is rejected before any download; it is
     not installed, since nothing reads it."""
+    patch_temporal = (config.get("patch_size"), config.get("temporal_patch_size"))
     expected = {
-        "patch_size": 16,
-        "temporal_patch_size": 2,
         "merge_size": 2,
         "image_mean": [0.5, 0.5, 0.5],
         "image_std": [0.5, 0.5, 0.5],
     }
-    if any(config.get(key) != value for key, value in expected.items()):
+    if patch_temporal not in ((16, 2), (14, 1)) or any(
+        config.get(key) != value for key, value in expected.items()
+    ):
         raise models.ModelError("unsupported vision preprocessing configuration")
 
 

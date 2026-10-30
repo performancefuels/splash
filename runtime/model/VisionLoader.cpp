@@ -48,7 +48,7 @@ Plan plan(const ops::VisionLayout &l) {
       addMuse(p + "attn_out.bias", l.hiddenSize);
       addMuse(p + "ln2.weight", l.hiddenSize);
       addMuse(p + "ln2.bias", l.hiddenSize);
-      addMuse(p + "ffn_up.weight", l.intermediateSize, l.hiddenSize, l.paddedIntermediateSize);
+      addMuse(p + "ffn_up.weight", l.intermediateSize, l.hiddenSize);
       addMuse(p + "ffn_up.bias", l.intermediateSize, 1);
       addMuse(p + "ffn_down.weight", l.hiddenSize, l.intermediateSize, l.paddedIntermediateSize);
       addMuse(p + "ffn_down.bias", l.hiddenSize, 1);

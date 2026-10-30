@@ -117,8 +117,9 @@ def prepare(
             if decoded.height * decoded.width > MAX_SOURCE_PIXELS:
                 raise ImageError("source image exceeds the pixel limit")
             stored = decoded.size
+            patch_budget = max_patches(max_pixels) * patch_size * patch_size
             height, width = smart_resize(
-                decoded.height, decoded.width, max_pixels, patch_size=patch_size
+                decoded.height, decoded.width, patch_budget, patch_size=patch_size
             )
             try:
                 # Cameras store the sensor's orientation and an EXIF tag that

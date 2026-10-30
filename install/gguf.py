@@ -283,8 +283,12 @@ def tokenizer_files(metadata):
     )
     backend.decoder = decoders.ByteLevel()
     # The index of each added token, and whether it is special.
+    # The index of each added token, and whether DecodeStream skips it as a
+    # special token; Muse Glimmer's sub-message tags (<|eom|>, <|start|>,
+    # <|message|>) are read by ReasoningSplitter like Qwen's </think>.
+    emitted_tags = {"<|eom|>", "<|start|>", "<|message|>"}
     added = {
-        index: kind == CONTROL_TOKEN
+        index: kind == CONTROL_TOKEN and tokens[index] not in emitted_tags
         for index, kind in enumerate(types)
         if kind in (CONTROL_TOKEN, USER_DEFINED_TOKEN)
     }
