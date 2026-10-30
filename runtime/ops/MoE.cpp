@@ -83,11 +83,12 @@ std::string routingKernel(std::string name, MoeShape shape, std::string_view Com
   return name;
 }
 
-// The staged and Apple7/8 MMA tiles pair independent gate/up simdgroups in one
-// pass; the register tile keeps its two passes.
+// The staged tile pairs gate/up; Apple7/8 MMA does so only in decode. Keep
+// timed prefill's dispatch cost and chunk selection unchanged.
 bool oneGateUpPass(const MoePlan &plan) noexcept {
   const MoeGgufTile tile = plan.configuration().ggufTile;
-  return tile == MoeGgufTile::Staged || tile == MoeGgufTile::Mma;
+  return tile == MoeGgufTile::Staged ||
+         (tile == MoeGgufTile::Mma && plan.phase() == MoePhase::Decode);
 }
 
 // The expert passes over grouped tiles, each on the grid of the live

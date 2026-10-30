@@ -135,6 +135,6 @@ using MoeExpertGgufMmaGateUpKernel =
       kernel MoeExpertGgufMmaGateUpKernel moe_expert_gguf_mma_gate_up<R, 1, S>; \
   template [[host_name("moe_expert_gguf_mma_m" #R "_gate_up_mixed" suffix)]] \
       kernel MoeExpertGgufMmaGateUpKernel moe_expert_gguf_mma_gate_up<R, 2, S>;
-MOE_MMA_GATE_UP(8, 1, "") MOE_MMA_GATE_UP(32, 1, "")
-MOE_MMA_GATE_UP(8, 2, "_s2") MOE_MMA_GATE_UP(32, 2, "_s2")
+MOE_MMA_GATE_UP(8, 1, "")
+MOE_MMA_GATE_UP(8, 2, "_s2")
 #undef MOE_MMA_GATE_UP
