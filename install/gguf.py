@@ -170,12 +170,22 @@ FLINT_PATTERNS = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
     r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 )
+# Muse Glimmer's (default): Llama-3/o200k-style split before byte-level BPE,
+# without NFC normalization.
+MUSE_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
 # Each GGUF tokenizer profile (tokenizer.ggml.pre) Splash derives a tokenizer
 # for: the patterns that split text, each isolating its matches, in order,
 # and whether text is NFC-normalized before them.
 TOKENIZER_PROFILES = {
     "qwen35": ((QWEN35_PATTERN,), True),
     "flint": (FLINT_PATTERNS, False),
+    "llama4": ((MUSE_PATTERN,), False),
 }
 # The GGUF token types (llama_token_type) a byte-level BPE vocabulary uses:
 # control tokens are special added tokens, user-defined ones added tokens
@@ -242,9 +252,13 @@ def tokenizer_files(metadata):
         if not isinstance(merge, str) or len(parts := merge.split(" ")) != 2:
             raise ModelError("invalid GGUF BPE merge")
         pairs.append(tuple(parts))
-    for key in ("tokenizer.ggml.add_bos_token", "tokenizer.ggml.add_eos_token"):
-        if metadata.values.get(key, False) is not False:
-            raise ModelError("GGUF automatic BOS/EOS insertion is unsupported: " + key)
+    if metadata.values.get("tokenizer.ggml.add_eos_token", False) is not False:
+        raise ModelError("GGUF automatic BOS/EOS insertion is unsupported: tokenizer.ggml.add_eos_token")
+    if (
+        metadata.values.get("tokenizer.ggml.add_bos_token", False) is not False
+        and text_architecture(metadata) != "muse-glimmer"
+    ):
+        raise ModelError("GGUF automatic BOS/EOS insertion is unsupported: tokenizer.ggml.add_bos_token")
     try:
         backend = Tokenizer(
             token_models.BPE({t: i for i, t in enumerate(tokens)}, pairs)
@@ -293,6 +307,8 @@ def tokenizer_files(metadata):
     template = metadata.require("tokenizer.chat_template", str)
     if not template.strip():
         raise ModelError("GGUF chat template is empty")
+    if text_architecture(metadata) == "muse-glimmer":
+        template = muse_chat_template(template, special_token("bos", optional=True))
     config = {
         "tokenizer_class": "TokenizersBackend",
         "model_max_length": metadata.positive(
@@ -464,11 +480,68 @@ def flint_text_config(metadata, arch):
     }
 
 
+def muse_chat_template(template, bos_token):
+    """Adapt Muse-Glimmer-30B's GGUF chat_template.jinja for Splash: inline
+    bos_token so add_special_tokens=False encodes it once, accept canonical
+    image_url content parts, map reasoning_effort onto reasoning_strength,
+    render later system messages in place without repeating tool schemas, and
+    open the to=self reasoning block in add_generation_prompt when thinking is
+    enabled."""
+    if bos_token:
+        template = template.replace("{{- bos_token -}}", "{{- " + repr(bos_token) + " -}}")
+    template = template.replace(
+        "{%- if part['type'] == 'image' -%}",
+        "{%- if part['type'] in ('image', 'image_url') -%}",
+    )
+    template = template.replace(
+        "{%- set rs = reasoning_strength if reasoning_strength is defined and reasoning_strength else 'high' -%}",
+        "{%- set rs = reasoning_strength if reasoning_strength is defined and reasoning_strength else (reasoning_effort if reasoning_effort is defined and reasoning_effort and reasoning_effort != 'none' else 'high') -%}",
+    )
+    template = template.replace(
+        "{%- set ns = namespace(has_system=false) -%}\n"
+        "{%- for m in messages -%}\n"
+        "    {%- if m['role'] == 'system' -%}\n"
+        "        {%- set ns.has_system = true -%}\n"
+        "    {%- endif -%}\n"
+        "{%- endfor -%}",
+        "{%- set ns = namespace(has_system=(messages and messages[0]['role'] == 'system')) -%}",
+    )
+    template = template.replace(
+        "    {%- if role == 'system' -%}",
+        "    {%- if role == 'system' and not loop.first -%}\n"
+        "        {{- '<|start|>system<|message|>' + render_content(message['content']) + '<|eot|>' -}}\n"
+        "    {%- elif role == 'system' -%}",
+    )
+    template = template.replace(
+        "{%- if add_generation_prompt -%}\n    {{- '<|start|>assistant' -}}\n{%- endif -%}",
+        "{%- if add_generation_prompt -%}\n"
+        "    {{- '<|start|>assistant to=user<|message|>' if enable_thinking is defined and not enable_thinking else '<|start|>assistant to=self<|message|>' -}}\n"
+        "{%- endif -%}",
+    )
+    return template
+
+
+def muse_text_config(metadata, arch):
+    sliding = layer_pattern(metadata, arch, "attention.sliding_window_pattern")
+    return {
+        "intermediate_size": metadata.positive(arch + ".feed_forward_length"),
+        "sliding_window": metadata.positive(arch + ".attention.sliding_window"),
+        "layer_types": [
+            "sliding_attention" if slides else "full_attention"
+            for slides in sliding
+        ],
+    }
+
+
 def vision_config(vision):
+    projector = vision.require("clip.projector_type", str)
     if (
         vision.require("general.architecture", str) != "clip"
-        or vision.require("clip.projector_type", str) != "qwen3vl_merger"
-        or vision.require("clip.use_gelu", bool) is not True
+        or projector not in ("qwen3vl_merger", "muse-glimmer")
+        or (
+            projector == "qwen3vl_merger"
+            and vision.require("clip.use_gelu", bool) is not True
+        )
     ):
         raise ModelError("unsupported GGUF vision architecture")
     fields = {
@@ -486,15 +559,18 @@ def vision_config(vision):
     image_size = vision.positive("clip.vision.image_size")
     if image_size % result["patch_size"]:
         raise ModelError("invalid GGUF vision position grid")
-    if any(vision.require("clip.vision.is_deepstack_layers", list)):
+    if projector == "qwen3vl_merger" and any(
+        vision.require("clip.vision.is_deepstack_layers", list)
+    ):
         raise ModelError("GGUF vision deepstack layers are unsupported")
-    # qwen3vl_merger uses RGB patches with two temporal slices; the native loader
-    # independently checks both patch tensors and every other weight shape.
+    muse = projector == "muse-glimmer"
     result.update(
-        temporal_patch_size=2,
+        temporal_patch_size=1 if muse else 2,
         in_channels=3,
-        num_position_embeddings=(image_size // result["patch_size"]) ** 2,
-        hidden_act="gelu_pytorch_tanh",
+        num_position_embeddings=1024
+        if muse
+        else (image_size // result["patch_size"]) ** 2,
+        hidden_act="gelu" if muse else "gelu_pytorch_tanh",
         deepstack_visual_indexes=[],
     )
     return result
@@ -699,6 +775,14 @@ FLINT_MOE_TENSORS = {
     for name, types in MOE_TENSORS.items()
     if name != "ffn_gate_inp_shexp.weight"
 }
+# Muse Glimmer (muse-glimmer): every layer attention with pre/post attention
+# and pre/post FFN RMS norms, and a dense SwiGLU FFN.
+MUSE_LAYER_TENSORS = {
+    "attn_norm.weight": NORM_TYPES,
+    "post_attention_norm.weight": NORM_TYPES,
+    "ffn_norm.weight": NORM_TYPES,
+    "post_ffw_norm.weight": NORM_TYPES,
+}
 
 
 @dataclass(frozen=True)
@@ -766,6 +850,15 @@ ARCHITECTURES = {
         leading_dense=True,
         text_config=flint_text_config,
         flat=True,
+    ),
+    "muse-glimmer": Architecture(
+        "muse_glimmer_text",
+        MODEL_TENSORS,
+        MUSE_LAYER_TENSORS,
+        moe=False,
+        attention_tensors={"attn_gate.weight": FORMAT_TYPES},
+        hybrid=False,
+        text_config=muse_text_config,
     ),
 }
 

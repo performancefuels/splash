@@ -27,6 +27,9 @@ struct Section {
   std::string mlx, gguf; // the tensor's names in either source
   uint32_t rows, columns, storedRows, storedColumns;
   bool patch = false; // the patch embedding, whose rows the writer reorders
+  bool roundFloat32 = false; // allow rounding F32 to nearest-even BF16
+  bool zeroFill = false; // no source tensor; left zeroed by zeroUnwritten
+  bool transposeMergeColumns = false; // transpose [1536, 4] -> [4, 1536] columns
   uint64_t offset = 0;
   std::vector<Input> inputs{};
 };

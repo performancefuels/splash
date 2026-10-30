@@ -63,6 +63,10 @@ PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv4_g8_d128, 32, 4, 128, 64, false, 
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv4_g8_d128_f32, 32, 4, 128, 64, false, float)
 PREFILL_ATTENTION_QKV_NOPE(prefill_attention_qkv_kv4_g8_d128_nope, 32, 4, 128, false, bfloat)
 PREFILL_ATTENTION_QKV_NOPE(prefill_attention_qkv_kv4_g8_d128_nope_f32, 32, 4, 128, false, float)
+PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g16_d128, 32, 2, 128, 64, true, bfloat)
+PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g16_d128_f32, 32, 2, 128, 64, true, float)
+PREFILL_ATTENTION_QKV_NOPE(prefill_attention_qkv_kv2_g16_d128_nope, 32, 2, 128, true, bfloat)
+PREFILL_ATTENTION_QKV_NOPE(prefill_attention_qkv_kv2_g16_d128_nope_f32, 32, 2, 128, true, float)
 #undef PREFILL_ATTENTION_QKV_NOPE
 #undef PREFILL_ATTENTION_QKV
 
@@ -91,6 +95,7 @@ PREFILL_ATTENTION_GATE(prefill_attention_gate, 24, 4, 256)
 PREFILL_ATTENTION_GATE(prefill_attention_gate_kv2_g8, 16, 2, 256)
 PREFILL_ATTENTION_GATE(prefill_attention_gate_kv2_g12, 24, 2, 256)
 PREFILL_ATTENTION_GATE(prefill_attention_gate_kv2_g16, 32, 2, 256)
+PREFILL_ATTENTION_GATE(prefill_attention_gate_kv2_g16_d128, 32, 2, 128)
 #undef PREFILL_ATTENTION_GATE
 
 // A layer without an output gate gathers its attention rows into the

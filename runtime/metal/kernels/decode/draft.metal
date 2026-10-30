@@ -47,7 +47,7 @@ inline void draft_qkv_prepare_phase(
     device const float *rope_cos, device const float *rope_sin,
     device bfloat *query_keys, device bfloat *query_values,
     threadgroup float *reductions, threadgroup bfloat *head, uint group,
-    uint thread_index, uint lane, uint simd_group) {
+    uint thread_index, uint lane, uint simd_group, float eps = kRmsEpsilon) {
   constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS,
                  QHeads = SPLASH_DRAFT_QUERY_HEADS,
                  KVHeads = SPLASH_DRAFT_KV_HEADS,
@@ -87,7 +87,7 @@ inline void draft_qkv_prepare_phase(
     float value = thread_index < HeadDim ? float(source[thread_index]) : 0.0f;
     const float inverse = rms_inverse_of_sums(value * value, HeadDim,
                                               reductions, thread_index, lane,
-                                              simd_group);
+                                              simd_group, eps);
     if (thread_index < HeadDim)
       head[thread_index] = bfloat(value * inverse * float(weight[thread_index]));
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -138,6 +138,41 @@ kernel void draft_context_kv_commit(
       rope_sin + ulong(batch) * RopeLaneStride, keys, values,
       params.start_position[batch], min(retained[batch], Rows), task,
       thread_index, lane, simd_group, reductions, normalized);
+}
+
+kernel void draft_context_kv_commit_eps1e5(
+    device const bfloat *context_kv [[buffer(0)]],
+    device const bfloat *k_norm [[buffer(1)]],
+    device const float *rope_cos [[buffer(2)]],
+    device const float *rope_sin [[buffer(3)]],
+    device bfloat *keys0 [[buffer(4)]], device bfloat *keys1 [[buffer(5)]],
+    device bfloat *keys2 [[buffer(6)]], device bfloat *keys3 [[buffer(7)]],
+    device bfloat *values0 [[buffer(8)]],
+    device bfloat *values1 [[buffer(9)]],
+    device bfloat *values2 [[buffer(10)]],
+    device bfloat *values3 [[buffer(11)]],
+    device const uint *retained [[buffer(12)]],
+    constant DraftContextBatchParams &params [[buffer(13)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
+  constexpr uint KVHeads = SPLASH_DRAFT_KV_HEADS;
+  constexpr uint RowWidth = 2 * KVHeads * SPLASH_DRAFT_HEAD_DIMENSION;
+  constexpr uint RopeLaneStride = Rows * SPLASH_DRAFT_ROPE_PAIRS;
+  uint batch = group / (Rows * KVHeads);
+  uint task = group % (Rows * KVHeads);
+  device bfloat *keys = SPLASH_LANE_BINDING(batch, keys0, keys1, keys2, keys3);
+  device bfloat *values = SPLASH_LANE_BINDING(batch, values0, values1, values2, values3);
+  threadgroup float reductions[8];
+  threadgroup bfloat normalized[SPLASH_DRAFT_HEAD_DIMENSION];
+  draft_context_kv_phase(
+      context_kv + ulong(batch) * Rows * RowWidth, k_norm,
+      rope_cos + ulong(batch) * RopeLaneStride,
+      rope_sin + ulong(batch) * RopeLaneStride, keys, values,
+      params.start_position[batch], min(retained[batch], Rows), task,
+      thread_index, lane, simd_group, reductions, normalized, 1e-5f);
 }
 
 // One split of the attention of one KV head over the 32 query rows of one
@@ -493,6 +528,37 @@ kernel void draft_attention_qkv(
       query_keys + batch * KVHeads * Rows * HeadDim,
       query_values + batch * KVHeads * HeadDim * Rows, reductions, head,
       group.x, thread_index, lane, simd_group);
+}
+
+kernel void draft_attention_qkv_eps1e5(
+    device const bfloat *proposal_qkv [[buffer(0)]],
+    device bfloat *queries [[buffer(1)]],
+    device const bfloat *q_norm [[buffer(2)]],
+    device const bfloat *k_norm [[buffer(3)]],
+    device const float *rope_cos [[buffer(4)]],
+    device const float *rope_sin [[buffer(5)]],
+    device bfloat *query_keys [[buffer(6)]],
+    device bfloat *query_values [[buffer(7)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
+  constexpr ulong Packed = SPLASH_DRAFT_QKV_WIDTH;
+  constexpr ulong Attention = SPLASH_DRAFT_ATTENTION_WIDTH;
+  constexpr ulong KVHeads = SPLASH_DRAFT_KV_HEADS;
+  constexpr ulong HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;
+  constexpr ulong RopeStride = Rows * SPLASH_DRAFT_ROPE_PAIRS;
+  uint batch = group.y;
+  threadgroup float reductions[8];
+  threadgroup bfloat head[SPLASH_DRAFT_HEAD_DIMENSION];
+  draft_qkv_prepare_phase(
+      proposal_qkv + batch * Rows * Packed,
+      queries + batch * Rows * Attention, q_norm, k_norm,
+      rope_cos + batch * RopeStride, rope_sin + batch * RopeStride,
+      query_keys + batch * KVHeads * Rows * HeadDim,
+      query_values + batch * KVHeads * HeadDim * Rows, reductions, head,
+      group.x, thread_index, lane, simd_group, 1e-5f);
 }
 
 // Grid {kv heads, lanes, splits}: every split streams its share of the live

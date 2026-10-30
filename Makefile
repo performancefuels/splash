@@ -309,6 +309,8 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/Qwen4ExpTarget.cpp \
 	runtime/model/Flint.cpp \
 	runtime/model/FlintTarget.cpp \
+	runtime/model/MuseGlimmer.cpp \
+	runtime/model/MuseGlimmerTarget.cpp \
 	runtime/model/QwenVision.cpp \
 	runtime/model/VisionPreparation.cpp \
 	runtime/model/VisionLoader.cpp \

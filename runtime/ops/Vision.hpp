@@ -16,15 +16,40 @@ struct VisionLayout final {
   uint32_t depth = 27;
   uint32_t hiddenSize = 1152;
   uint32_t patchDimension = 1536;
+  uint32_t paddedPatchDimension = 1536;
   uint32_t intermediateSize = 4304;
   uint32_t paddedIntermediateSize = 4352;
   uint32_t mergedHiddenSize = 4608;
+  uint32_t projectorHiddenSize = 4608;
   uint32_t outputHiddenSize = 0;
   uint32_t heads = 16;
   uint32_t headDimension = 72;
   uint32_t positionGridSide = 48;
   uint32_t patchSize = 16;
   uint32_t spatialMerge = 2;
+  uint32_t temporalPatchSize = 2;
+  uint32_t windowGridSide = 0;
+  bool museTower = false;
+
+  static constexpr VisionLayout museGlimmer() noexcept {
+    return {.depth = 50,
+            .hiddenSize = 1536,
+            .patchDimension = 588,
+            .paddedPatchDimension = 640,
+            .intermediateSize = 8960,
+            .paddedIntermediateSize = 8960,
+            .mergedHiddenSize = 6144,
+            .projectorHiddenSize = 4096,
+            .outputHiddenSize = 6656,
+            .heads = 16,
+            .headDimension = 96,
+            .positionGridSide = 32,
+            .patchSize = 14,
+            .spatialMerge = 2,
+            .temporalPatchSize = 1,
+            .windowGridSide = 32,
+            .museTower = true};
+  }
 
   bool operator==(const VisionLayout &) const = default;
 };
@@ -52,9 +77,11 @@ struct VisionWeights final {
   VisionLayout layout;
   VisionAffine patchEmbedding;
   metal::MetalBuffer positionTable;
+  VisionNorm preNorm;
   std::vector<VisionBlock> blocks;
   VisionNorm mergerNorm;
   VisionAffine mergerUpProjection;
+  VisionAffine mergerMidProjection;
   VisionAffine mergerDownProjection;
 };
 

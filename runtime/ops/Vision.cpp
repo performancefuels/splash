@@ -26,13 +26,21 @@ constexpr uint32_t kQkDimension = 80; // head dimension 72 padded to 16
 constexpr uint64_t kBf16Bytes = 2;
 constexpr uint64_t kFloatBytes = 4;
 
-// The one vision tower the kernels are specialized for.
+// The two vision towers the kernels are specialized for: Qwen3.5's 27-block
+// tower and Muse Glimmer's 50-block ViT-G/14 tower.
 constexpr VisionLayout kTower{};
+constexpr VisionLayout kMuseTower = VisionLayout::museGlimmer();
 static_assert(kTower.headDimension + 8 == kQkDimension && kTower.hiddenSize % kGemmColumnTile == 0 &&
                   kTower.paddedIntermediateSize % kGemmColumnTile == 0 &&
                   kTower.mergedHiddenSize % kMergerColumnTile == 0 &&
-                  kTower.patchDimension % kGemmColumnTile == 0,
-              "vision kernels' tile assumptions");
+                  kTower.paddedPatchDimension % kGemmColumnTile == 0,
+              "Qwen vision kernels' tile assumptions");
+static_assert(kMuseTower.headDimension == 96 && kMuseTower.hiddenSize % kGemmColumnTile == 0 &&
+                  kMuseTower.paddedIntermediateSize % kGemmColumnTile == 0 &&
+                  kMuseTower.mergedHiddenSize % kMergerColumnTile == 0 &&
+                  kMuseTower.projectorHiddenSize % kMergerColumnTile == 0 &&
+                  kMuseTower.paddedPatchDimension % kGemmColumnTile == 0,
+              "Muse vision kernels' tile assumptions");
 
 uint32_t roundUp(uint32_t value, uint32_t multiple) noexcept {
   return (value + multiple - 1) / multiple * multiple;
@@ -48,8 +56,9 @@ std::array<uint64_t, 12> scratchLayout(const VisionLayout &layout,
   const uint64_t mergedRows = roundUp(maximumPatches / 4, kMergerRowTile);
   const uint64_t hidden = layout.hiddenSize;
   const uint64_t headRows = uint64_t{layout.heads} * padded;
+  const uint64_t qkDim = layout.museTower ? layout.headDimension : kQkDimension;
   return {
-      rows * layout.patchDimension * kBf16Bytes,                 // Patches
+      rows * layout.paddedPatchDimension * kBf16Bytes,           // Patches
       uint64_t{maximumPatches} * layout.headDimension * kFloatBytes, // RopeCos
       uint64_t{maximumPatches} * layout.headDimension * kFloatBytes, // RopeSin
       rows * hidden * kFloatBytes,                               // Hidden
@@ -58,8 +67,8 @@ std::array<uint64_t, 12> scratchLayout(const VisionLayout &layout,
       std::max(rows * 3 * hidden, mergedRows * layout.mergedHiddenSize) *
           kBf16Bytes,                                            // Qkv
       rows * layout.paddedIntermediateSize * kBf16Bytes,         // Intermediate
-      headRows * kQkDimension * kBf16Bytes,                      // Queries
-      headRows * kQkDimension * kBf16Bytes,                      // Keys
+      headRows * qkDim * kBf16Bytes,                             // Queries
+      headRows * qkDim * kBf16Bytes,                             // Keys
       headRows * layout.headDimension * kBf16Bytes,              // Values
       headRows * layout.headDimension * kBf16Bytes,              // Attention
       rows * hidden * kBf16Bytes,                                // Context
@@ -67,8 +76,13 @@ std::array<uint64_t, 12> scratchLayout(const VisionLayout &layout,
 }
 
 void requireLayout(const VisionLayout &layout) {
-  // The targets share the same vision tower; only the language-space
-  // projection width varies with the text model.
+  if (layout.museTower) {
+    if (layout != kMuseTower) {
+      throw std::invalid_argument(
+          "vision kernels are specialized for the Qwen3.5 27-block or Muse Glimmer 50-block tower");
+    }
+    return;
+  }
   VisionLayout tower = layout;
   tower.outputHiddenSize = kTower.outputHiddenSize;
   if (tower != kTower || !layout.outputHiddenSize || layout.outputHiddenSize % kMergerColumnTile) {
@@ -97,10 +111,13 @@ void requireWeights(const VisionWeights &model) {
     requireBytes(norm.weight, hidden * kBf16Bytes, name + " weight");
     requireBytes(norm.bias, hidden * kBf16Bytes, name + " bias");
   };
-  requireAffine(model.patchEmbedding, hidden, layout.patchDimension, "vision patch embedding");
+  requireAffine(model.patchEmbedding, hidden, layout.paddedPatchDimension, "vision patch embedding");
   requireBytes(model.positionTable,
                uint64_t{layout.positionGridSide} * layout.positionGridSide * hidden * kBf16Bytes,
                "vision position table");
+  if (layout.museTower) {
+    requireNorm(model.preNorm, "vision pre-norm");
+  }
   for (const VisionBlock &block : model.blocks) {
     requireNorm(block.norm1, "vision attention norm");
     requireAffine(block.qkv, 3 * hidden, hidden, "vision q/k/v");
@@ -110,8 +127,13 @@ void requireWeights(const VisionWeights &model) {
     requireAffine(block.downProjection, hidden, layout.paddedIntermediateSize, "vision down projection");
   }
   requireNorm(model.mergerNorm, "vision merger norm");
-  requireAffine(model.mergerUpProjection, merged, merged, "vision merger up projection");
-  requireAffine(model.mergerDownProjection, layout.outputHiddenSize, merged, "vision merger down projection");
+  requireAffine(model.mergerUpProjection, layout.projectorHiddenSize, merged, "vision merger up projection");
+  if (layout.museTower) {
+    requireAffine(model.mergerMidProjection, layout.projectorHiddenSize, layout.projectorHiddenSize,
+                  "vision merger mid projection");
+  }
+  requireAffine(model.mergerDownProjection, layout.outputHiddenSize, layout.projectorHiddenSize,
+                "vision merger down projection");
 }
 
 } // namespace
@@ -172,7 +194,8 @@ void Vision::addGemm(CommandGraph &graph, const char *tile,
 void Vision::addNorm(CommandGraph &graph, const MetalBuffer &input,
                      const VisionNorm &weights, const MetalBuffer &output,
                      uint32_t rows) const {
-  graph.add("vision_layer_norm", {input, weights.weight, weights.bias, output},
+  const char *kernel = model_.layout.museTower ? "vision_layer_norm_muse" : "vision_layer_norm";
+  graph.add(kernel, {input, weights.weight, weights.bias, output},
             VisionNormParams{model_.layout.hiddenSize}, {rows, 1, 1});
 }
 
@@ -203,42 +226,63 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
   const uint32_t attentionThreads =
       mma_ ? SPLASH_VISION_ATTENTION_MMA_THREADS : SPLASH_VISION_ATTENTION_THREADS;
 
-  graph.add("vision_patchify", {pixels, scratch(Scratch::Patches)}, gridParams,
+  graph.add(layout.museTower ? "vision_patchify_p14" : "vision_patchify",
+            {pixels, scratch(Scratch::Patches)}, gridParams,
             {tokens, 1, 1});
   // The positions start the residual stream the patch embedding adds to.
-  graph.add("vision_prepare_positions",
+  graph.add(layout.museTower ? "vision_prepare_positions_muse" : "vision_prepare_positions",
             {model_.positionTable, hidden, scratch(Scratch::RopeCos),
              scratch(Scratch::RopeSin)},
             gridParams, {roundUp(tokens, kGemmRowTile), 1, 1});
   addGemm(graph, "m64n128_residual", scratch(Scratch::Patches),
           model_.patchEmbedding, hidden, hidden, layout.hiddenSize,
-          layout.patchDimension, tokens, kGemmRowTile, kGemmColumnTile);
+          layout.paddedPatchDimension, tokens, kGemmRowTile, kGemmColumnTile);
+  if (layout.museTower) {
+    graph.add("vision_layer_norm_inplace_muse",
+              {hidden, model_.preNorm.weight, model_.preNorm.bias},
+              VisionNormParams{layout.hiddenSize}, {tokens, 1, 1});
+  }
 
-  for (const VisionBlock &block : model_.blocks) {
+  for (uint32_t blockIndex = 0; blockIndex < model_.blocks.size(); ++blockIndex) {
+    const VisionBlock &block = model_.blocks[blockIndex];
     addNorm(graph, hidden, block.norm1, normalized, tokens);
     addGemm(graph, "m64n128", normalized, block.qkv, qkv, hidden,
             3 * layout.hiddenSize, layout.hiddenSize, tokens, kGemmRowTile,
             kGemmColumnTile);
     // Padded key tokens are zeroed by the prepare pass so every 128-key tile
     // is finite under the softmax mask.
-    graph.add("vision_qkv_prepare",
+    graph.add(layout.museTower ? "vision_qkv_prepare_d96" : "vision_qkv_prepare",
               {qkv, scratch(Scratch::RopeCos), scratch(Scratch::RopeSin),
                scratch(Scratch::Queries), scratch(Scratch::Keys),
                scratch(Scratch::Values)},
               qkvParams, {padded, 1, 1});
-    graph.add(mma_ ? "vision_attention_mma" : "vision_attention",
-              {scratch(Scratch::Queries), scratch(Scratch::Keys),
-               scratch(Scratch::Values), scratch(Scratch::Attention)},
-              attentionParams,
-              {(tokens + attentionRows - 1) / attentionRows, layout.heads, 1},
-              {attentionThreads, 1, 1});
-    graph.add("vision_attention_gather", {scratch(Scratch::Attention), context},
+    if (layout.museTower) {
+      const uint32_t windowed = (blockIndex + 1 != layout.depth && (blockIndex + 1) % 4 != 0) ? 1u : 0u;
+      const MuseVisionAttentionParams museAttn{
+          tokens, padded, 1.0F / std::sqrt(static_cast<float>(layout.headDimension)), grid.width, windowed};
+      graph.add(mma_ ? "vision_attention_mma_d96" : "vision_attention_d96",
+                {scratch(Scratch::Queries), scratch(Scratch::Keys),
+                 scratch(Scratch::Values), scratch(Scratch::Attention)},
+                museAttn,
+                {(tokens + attentionRows - 1) / attentionRows, layout.heads, 1},
+                {attentionThreads, 1, 1});
+    } else {
+      graph.add(mma_ ? "vision_attention_mma" : "vision_attention",
+                {scratch(Scratch::Queries), scratch(Scratch::Keys),
+                 scratch(Scratch::Values), scratch(Scratch::Attention)},
+                attentionParams,
+                {(tokens + attentionRows - 1) / attentionRows, layout.heads, 1},
+                {attentionThreads, 1, 1});
+    }
+    graph.add(layout.museTower ? "vision_attention_gather_d96" : "vision_attention_gather",
+              {scratch(Scratch::Attention), context},
               qkvParams, {tokens, 1, 1});
     addGemm(graph, "m64n128_residual", context, block.projection, hidden,
             hidden, layout.hiddenSize, layout.hiddenSize, tokens, kGemmRowTile,
             kGemmColumnTile);
     addNorm(graph, hidden, block.norm2, normalized, tokens);
-    addGemm(graph, "m64n128_gelu_tanh", normalized, block.upProjection,
+    addGemm(graph, layout.museTower ? "m64n128_gelu_erf" : "m64n128_gelu_tanh",
+            normalized, block.upProjection,
             scratch(Scratch::Intermediate), hidden,
             layout.paddedIntermediateSize, layout.hiddenSize, tokens,
             kGemmRowTile, kGemmColumnTile);
@@ -248,17 +292,28 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
             kGemmColumnTile);
   }
 
-  // The merger reads the normalized rows as (merged, 4608): four consecutive
-  // block-major patches form one merged token.
+  // The merger reads the normalized rows as (merged, mergedHiddenSize): four
+  // consecutive block-major patches form one merged token.
   addNorm(graph, hidden, model_.mergerNorm, normalized, tokens);
   addGemm(graph, "m32n256_gelu_erf", normalized,
           model_.mergerUpProjection,
-          qkv, hidden, layout.mergedHiddenSize, layout.mergedHiddenSize, merged,
+          qkv, hidden, layout.projectorHiddenSize, layout.mergedHiddenSize, merged,
           kMergerRowTile, kMergerColumnTile);
-  addGemm(graph, "m32n256", qkv, model_.mergerDownProjection,
-          embeddings,
-          hidden, layout.outputHiddenSize, layout.mergedHiddenSize, merged,
-          kMergerRowTile, kMergerColumnTile);
+  if (layout.museTower) {
+    addGemm(graph, "m32n256_gelu_erf", qkv,
+            model_.mergerMidProjection,
+            normalized, hidden, layout.projectorHiddenSize, layout.projectorHiddenSize, merged,
+            kMergerRowTile, kMergerColumnTile);
+    addGemm(graph, "m32n256", normalized, model_.mergerDownProjection,
+            embeddings,
+            hidden, layout.outputHiddenSize, layout.projectorHiddenSize, merged,
+            kMergerRowTile, kMergerColumnTile);
+  } else {
+    addGemm(graph, "m32n256", qkv, model_.mergerDownProjection,
+            embeddings,
+            hidden, layout.outputHiddenSize, layout.projectorHiddenSize, merged,
+            kMergerRowTile, kMergerColumnTile);
+  }
 }
 
 } // namespace splash::ops

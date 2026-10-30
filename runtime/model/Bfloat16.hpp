@@ -17,4 +17,10 @@ namespace splash::model {
 // The float a bf16's bits hold.
 [[nodiscard]] inline float widenBfloat16(uint16_t bits) { return std::bit_cast<float>(uint32_t{bits} << 16); }
 
+// IEEE-754 round-to-nearest-even conversion from F32 to BF16.
+[[nodiscard]] inline uint16_t roundToBfloat16(float value) {
+  const uint32_t bits = std::bit_cast<uint32_t>(value);
+  return static_cast<uint16_t>((bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16);
+}
+
 } // namespace splash::model

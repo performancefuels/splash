@@ -36,7 +36,17 @@ public:
                               const NormWeights &weight, metal::MetalBuffer output,
                               uint32_t width, uint32_t rows,
                               LinearScratch scratch = {},
-                              LinearInput layout = LinearInput::Plain);
+                              LinearInput layout = LinearInput::Plain,
+                              float eps = SPLASH_RMS_EPSILON);
+  static void addUnitRms(metal::CommandGraph &graph, metal::MetalBuffer input,
+                         metal::MetalBuffer output, uint32_t width, uint32_t rows,
+                         float eps = SPLASH_RMS_EPSILON);
+  static void addRmsResidual(metal::CommandGraph &graph, metal::MetalBuffer input,
+                             const NormWeights &weight, metal::MetalBuffer residual,
+                             metal::MetalBuffer output, uint32_t width, uint32_t rows,
+                             float eps = SPLASH_RMS_EPSILON);
+  static void addLogitSoftcap(metal::CommandGraph &graph, metal::MetalBuffer logits,
+                              uint32_t count, float scale, float softcap);
 };
 
 } // namespace splash::ops

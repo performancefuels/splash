@@ -463,9 +463,13 @@ void QwenTarget::addNormalizedHead(metal::CommandGraph &graph, const ops::NormWe
                                    metal::MetalBuffer logits, uint32_t lanes, ops::LinearScratch scratch) const {
   const ops::PreparedInput normalized =
       ops::Normalization::addRms(graph, std::move(hidden), finalNorm, finalHidden, geometry_.hiddenSize,
-                                 lanes * kVerifyRows, scratch, decodeInput(vocabularyProjection(), lanes));
-  addDecodeProjection(graph, std::move(finalHidden), vocabularyProjection(), std::move(logits), lanes, scratch,
+                                 lanes * kVerifyRows, scratch, decodeInput(vocabularyProjection(), lanes),
+                                 static_cast<float>(geometry_.rmsEpsilon));
+  addDecodeProjection(graph, std::move(finalHidden), vocabularyProjection(), logits, lanes, scratch,
                       normalized);
+  ops::Normalization::addLogitSoftcap(graph, std::move(logits),
+                                      lanes * kVerifyRows * geometry_.vocabularySize,
+                                      geometry_.logitScale, geometry_.finalLogitSoftcap);
 }
 
 void QwenTarget::addCapture(metal::CommandGraph &graph, uint32_t slot, metal::MetalBuffer output,

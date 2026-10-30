@@ -113,7 +113,7 @@ COMPLETION_DEFAULT_MAX_TOKENS = 16
 IMAGE_RENDER_MARKER = f"__splash_image_{secrets.token_hex(16)}__"
 
 
-def _generation_prompt(probed, rendered, tokens):
+def _generation_prompt(probed, rendered, tokens, chat_format=None):
     """Whether the generation prompt opens a think block, and how many of the
     prompt's last tokens it is (zero where they differ from its tokens).
     `probed` is its text and tokens, as the startup probe found them for the
@@ -125,8 +125,10 @@ def _generation_prompt(probed, rendered, tokens):
             400, "chat template must end with an assistant generation prefix"
         )
     count = len(ids)
+    start_tag = chat_format.think_start_tag if chat_format is not None else THINK_START
+    end_tag = chat_format.think_end_tag if chat_format is not None else THINK_END
     return (
-        text.rfind(THINK_START) > text.rfind(THINK_END),
+        text.rfind(start_tag) > text.rfind(end_tag),
         count if count < len(tokens) and tuple(tokens[-count:]) == ids else 0,
     )
 
@@ -374,7 +376,11 @@ class Frontend:
             remaining_request_time(deadline)
             try:
                 payload = image_input.decode_data_url(part["image_url"]["url"])
-                image = self.images.prepare(payload, self.max_image_pixels)
+                image = self.images.prepare(
+                    payload,
+                    self.max_image_pixels,
+                    patch_size=self.chat_format.image_patch_size,
+                )
                 tokens += image.tokens
                 pixel_bytes += len(image.pixels)
                 self._check_image_request_size(
@@ -423,13 +429,14 @@ class Frontend:
         each real image to its placeholder even when a coding agent has read
         documentation or source containing literal vision tokens.
         """
+        pad_token = self.chat_format.image_pad_token
         rendered = self._apply_chat_template(
             messages,
             {
                 **template,
                 "tokenize": False,
                 "chat_template": template["chat_template"].replace(
-                    IMAGE_PAD_TOKEN, IMAGE_RENDER_MARKER
+                    pad_token, IMAGE_RENDER_MARKER
                 ),
             },
         )
@@ -438,9 +445,9 @@ class Frontend:
         offset = 0
         for part in parts[:-1]:
             offset += len(part)
-            image_offsets.add((offset, offset + len(IMAGE_PAD_TOKEN)))
-            offset += len(IMAGE_PAD_TOKEN)
-        rendered = IMAGE_PAD_TOKEN.join(parts)
+            image_offsets.add((offset, offset + len(pad_token)))
+            offset += len(pad_token)
+        rendered = pad_token.join(parts)
         encoded = self._tokenize(
             rendered,
             add_special_tokens=False,
@@ -454,7 +461,7 @@ class Frontend:
         return list(encoded["input_ids"]), positions, rendered
 
     def _image_token_count(self, prompt_tokens, prepared, positions):
-        pad_id = self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN)
+        pad_id = self.tokenizer.convert_tokens_to_ids(self.chat_format.image_pad_token)
         if len(positions) != len(prepared) or any(
             prompt_tokens[position] != pad_id for position in positions
         ):
@@ -473,7 +480,7 @@ class Frontend:
             sum(len(image.pixels) for image in prepared),
         )
         expanded, spans, cursor = [], [], 0
-        pad_id = self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN)
+        pad_id = self.tokenizer.convert_tokens_to_ids(self.chat_format.image_pad_token)
         for position, image in zip(positions, prepared):
             expanded.extend(prompt_tokens[cursor:position])
             spans.append(
@@ -958,7 +965,11 @@ class Frontend:
                 prompt.messages, deadline, check_context=check_context
             )
         remaining_request_time(deadline)
-        if images and self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN) is None:
+        if (
+            images
+            and self.tokenizer.convert_tokens_to_ids(self.chat_format.image_pad_token)
+            is None
+        ):
             raise APIError(400, "the tokenizer does not define the image pad token")
         positions = []
         try:
@@ -996,7 +1007,10 @@ class Frontend:
         thinking, generation_prompt_tokens = False, 0
         if add_generation_prompt:
             thinking, generation_prompt_tokens = _generation_prompt(
-                chat_template.generation_prompt(template), rendered, tokens
+                chat_template.generation_prompt(template),
+                rendered,
+                tokens,
+                self.chat_format,
             )
         return RenderedPrompt(
             rendered, tokens, images, positions, thinking, generation_prompt_tokens
@@ -1141,7 +1155,8 @@ class Frontend:
             (
                 reasoning
                 + self._tokenize(
-                    TOOL_CALL_OPEN + chat_format.call_syntax.function_opening(name),
+                    chat_format.call_syntax.call_open_tag
+                    + chat_format.call_syntax.function_opening(name),
                     add_special_tokens=False,
                 )["input_ids"],
                 f"tool {name} has too many parameters to constrain",

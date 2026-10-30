@@ -248,6 +248,8 @@ VISION_GEMM_KERNEL(vision_gemm_m64n128_residual, 64, 128, VisionNone, true,
                    float)
 VISION_GEMM_KERNEL(vision_gemm_m64n128_gelu_tanh, 64, 128, VisionGeluTanh, false,
                    bfloat)
+VISION_GEMM_KERNEL(vision_gemm_m64n128_gelu_erf, 64, 128, VisionGeluErf, false,
+                   bfloat)
 // The merger's 256-divisible output sizes use the wider tile.
 VISION_GEMM_KERNEL(vision_gemm_m32n256, 32, 256, VisionNone, false, bfloat)
 VISION_GEMM_KERNEL(vision_gemm_m32n256_gelu_erf, 32, 256, VisionGeluErf,
@@ -538,6 +540,402 @@ kernel void vision_attention_gather(
         uint dim = index % kVisionHeadDim;
         row[index] = padded[
             (ulong(head) * params.padded_tokens + token) * kVisionHeadDim +
+            dim];
+    }
+}
+
+// Muse Glimmer 50-layer ViT-G/14 vision encoder kernels: patch size 14 (588
+// features padded to 640), hidden size 1536, 16 heads of 96 dimensions, 32x32
+// learned position grid, 1e-5 LayerNorm epsilon, and 32x32 windowed attention
+// on 3 of every 4 layers (global on every 4th and the last).
+constant ushort kMuseVisionHeads = 16;
+constant ushort kMuseVisionHeadDim = 96;
+constant ushort kMuseVisionHidden = 1536;
+constant ushort kMuseVisionPatch = 14;
+constant ushort kMuseVisionPatchDim = 588;       // 3 channels x 14 x 14
+constant ushort kMuseVisionPatchDimPadded = 640; // 5 x 128
+constant ushort kMuseVisionGridSide = 32;
+constant float kMuseVisionNormEps = 1e-5f;
+
+inline void vision_bilinear_taps_32(uint index, uint size, thread uint *tap,
+                                    thread float *weight) {
+    float source = size > 1
+        ? float(index) * float(kMuseVisionGridSide - 1) / float(size - 1)
+        : 0.0f;
+    float lower = floor(source);
+    for (uint offset = 0; offset < 2; ++offset) {
+        float position = lower + float(offset);
+        tap[offset] = uint(clamp(position, 0.0f, float(kMuseVisionGridSide - 1)));
+        weight[offset] = max(1.0f - fabs(source - position), 0.0f);
+    }
+}
+
+kernel void vision_patchify_p14(
+    device const uchar *pixels [[buffer(0)]],
+    device bfloat *patches [[buffer(1)]],
+    constant VisionGridParams &params [[buffer(2)]],
+    uint token [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]])
+{
+    uint2 position = vision_patch_position(token, params.grid_width);
+    uint image_width = params.grid_width * kMuseVisionPatch;
+    device bfloat *row = patches + ulong(token) * kMuseVisionPatchDimPadded;
+    for (uint feature = thread_index; feature < kMuseVisionPatchDimPadded;
+         feature += 256) {
+        if (feature >= kMuseVisionPatchDim) {
+            row[feature] = bfloat(0.0f);
+            continue;
+        }
+        uint channel = feature / (kMuseVisionPatch * kMuseVisionPatch);
+        uint within = feature % (kMuseVisionPatch * kMuseVisionPatch);
+        uint patch_row = within / kMuseVisionPatch;
+        uint patch_col = within % kMuseVisionPatch;
+        ulong pixel = (ulong(position.x * kMuseVisionPatch + patch_row) *
+                           image_width +
+                       position.y * kMuseVisionPatch + patch_col) * 3 + channel;
+        row[feature] = bfloat(float(pixels[pixel]) * (1.0f / 127.5f) - 1.0f);
+    }
+}
+
+kernel void vision_prepare_positions_muse(
+    device const bfloat *table [[buffer(0)]],
+    device float *hidden [[buffer(1)]],
+    device float *rope_cos [[buffer(2)]],
+    device float *rope_sin [[buffer(3)]],
+    constant VisionGridParams &params [[buffer(4)]],
+    uint token [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]])
+{
+    device float *out = hidden + ulong(token) * kMuseVisionHidden;
+    if (token >= params.grid_height * params.grid_width) {
+        for (uint dim = thread_index; dim < kMuseVisionHidden; dim += 256)
+            out[dim] = 0.0f;
+        return;
+    }
+    uint2 position = vision_patch_position(token, params.grid_width);
+    uint row_taps[2], col_taps[2];
+    float row_weights[2], col_weights[2];
+    vision_bilinear_taps_32(position.x, params.grid_height, row_taps, row_weights);
+    vision_bilinear_taps_32(position.y, params.grid_width, col_taps, col_weights);
+
+    for (uint dim = thread_index; dim < kMuseVisionHidden; dim += 256) {
+        float blended = 0.0f;
+        for (uint h = 0; h < 2; ++h) {
+            for (uint w = 0; w < 2; ++w) {
+                blended += row_weights[h] * col_weights[w] *
+                    float(table[(ulong(row_taps[h]) * kMuseVisionGridSide +
+                                 col_taps[w]) * kMuseVisionHidden + dim]);
+            }
+        }
+        out[dim] = blended;
+    }
+
+    if (thread_index < kMuseVisionHeadDim) {
+        uint pair = (thread_index % (kMuseVisionHeadDim / 2)) / 2;
+        bool width_coord = thread_index < (kMuseVisionHeadDim / 2);
+        float inverse = pow(kVisionRopeTheta,
+                            -float(2 * pair) / float(kMuseVisionHeadDim / 2));
+        float angle = float((width_coord ? position.y : position.x) + 1u) * inverse;
+        rope_cos[ulong(token) * kMuseVisionHeadDim + thread_index] = cos(angle);
+        rope_sin[ulong(token) * kMuseVisionHeadDim + thread_index] = sin(angle);
+    }
+}
+
+kernel void vision_layer_norm_muse(
+    device const float *input [[buffer(0)]],
+    device const bfloat *weight [[buffer(1)]],
+    device const bfloat *bias [[buffer(2)]],
+    device bfloat *output [[buffer(3)]],
+    constant VisionNormParams &params [[buffer(4)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float reductions[8];
+    device const float *row = input + ulong(group) * params.width;
+    device bfloat *out = output + ulong(group) * params.width;
+
+    float sum = 0.0f;
+    for (uint column = thread_index; column < params.width; column += 256) {
+        sum += row[column];
+    }
+    sum = simd_sum(sum);
+    if (simd_lane == 0) reductions[simd_group] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.0f;
+    #pragma unroll
+    for (ushort i = 0; i < 8; ++i) total += reductions[i];
+    float mean = total / float(params.width);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float squares = 0.0f;
+    for (uint column = thread_index; column < params.width; column += 256) {
+        float centered = row[column] - mean;
+        squares += centered * centered;
+    }
+    squares = simd_sum(squares);
+    if (simd_lane == 0) reductions[simd_group] = squares;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float variance = 0.0f;
+    #pragma unroll
+    for (ushort i = 0; i < 8; ++i) variance += reductions[i];
+    variance /= float(params.width);
+    float inverse = rsqrt(variance + kMuseVisionNormEps);
+
+    for (uint column = thread_index; column < params.width; column += 256) {
+        float normalized = (row[column] - mean) * inverse;
+        out[column] = bfloat(normalized * float(weight[column]) +
+                             float(bias[column]));
+    }
+}
+
+kernel void vision_layer_norm_inplace_muse(
+    device float *hidden [[buffer(0)]],
+    device const bfloat *weight [[buffer(1)]],
+    device const bfloat *bias [[buffer(2)]],
+    constant VisionNormParams &params [[buffer(3)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float reductions[8];
+    device float *row = hidden + ulong(group) * params.width;
+
+    float sum = 0.0f;
+    for (uint column = thread_index; column < params.width; column += 256) {
+        sum += row[column];
+    }
+    sum = simd_sum(sum);
+    if (simd_lane == 0) reductions[simd_group] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.0f;
+    #pragma unroll
+    for (ushort i = 0; i < 8; ++i) total += reductions[i];
+    float mean = total / float(params.width);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float squares = 0.0f;
+    for (uint column = thread_index; column < params.width; column += 256) {
+        float centered = row[column] - mean;
+        squares += centered * centered;
+    }
+    squares = simd_sum(squares);
+    if (simd_lane == 0) reductions[simd_group] = squares;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float variance = 0.0f;
+    #pragma unroll
+    for (ushort i = 0; i < 8; ++i) variance += reductions[i];
+    variance /= float(params.width);
+    float inverse = rsqrt(variance + kMuseVisionNormEps);
+
+    for (uint column = thread_index; column < params.width; column += 256) {
+        float normalized = (row[column] - mean) * inverse;
+        row[column] = float(bfloat(normalized * float(weight[column]) +
+                                   float(bias[column])));
+    }
+}
+
+kernel void vision_qkv_prepare_d96(
+    device const bfloat *qkv [[buffer(0)]],
+    device const float *rope_cos [[buffer(1)]],
+    device const float *rope_sin [[buffer(2)]],
+    device bfloat *queries [[buffer(3)]],
+    device bfloat *keys [[buffer(4)]],
+    device bfloat *values [[buffer(5)]],
+    constant VisionQkvParams &params [[buffer(6)]],
+    uint token [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]])
+{
+    const bool valid = token < params.tokens;
+    device const bfloat *row =
+        qkv + ulong(token) * 3 * kMuseVisionHeads * kMuseVisionHeadDim;
+    device const float *cos_row = rope_cos + ulong(token) * kMuseVisionHeadDim;
+    device const float *sin_row = rope_sin + ulong(token) * kMuseVisionHeadDim;
+
+    for (uint index = thread_index;
+         index < uint(kMuseVisionHeads) * kMuseVisionHeadDim; index += 256) {
+        uint head = index / kMuseVisionHeadDim;
+        uint dim = index % kMuseVisionHeadDim;
+        ulong plane = (ulong(head) * params.padded_tokens + token) *
+            kMuseVisionHeadDim + dim;
+        if (!valid) {
+            queries[plane] = bfloat(0.0f);
+            keys[plane] = bfloat(0.0f);
+            values[plane] = bfloat(0.0f);
+            continue;
+        }
+        uint base = head * kMuseVisionHeadDim + dim;
+        uint rotated = head * kMuseVisionHeadDim + (dim ^ 1u);
+        float sign = (dim & 1u) ? 1.0f : -1.0f;
+        float cos_value = cos_row[dim];
+        float sin_value = sin_row[dim];
+        queries[plane] = bfloat(float(row[base]) * cos_value +
+            sign * float(row[rotated]) * sin_value);
+        keys[plane] = bfloat(float(row[kMuseVisionHidden + base]) * cos_value +
+            sign * float(row[kMuseVisionHidden + rotated]) * sin_value);
+        values[plane] = bfloat(float(row[2 * kMuseVisionHidden + base]));
+    }
+}
+
+kernel void vision_attention_d96(
+    device bfloat *queries [[buffer(0)]],
+    device bfloat *keys [[buffer(1)]],
+    device bfloat *values [[buffer(2)]],
+    device bfloat *output [[buffer(3)]],
+    constant MuseVisionAttentionParams &params [[buffer(4)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]])
+{
+    constexpr ushort M = SPLASH_VISION_ATTENTION_ROWS, N = 128,
+                     D = kMuseVisionHeadDim, DQ = kMuseVisionHeadDim;
+    constexpr ushort Simdgroups = SPLASH_VISION_ATTENTION_THREADS / 32;
+    constexpr ushort LanesPerRow = Simdgroups * 32 / M;
+    constexpr ushort Runs = N / (LanesPerRow * 4);
+    alignas(16) threadgroup float score_storage[M * N];
+    alignas(16) threadgroup bfloat probabilities[M * N];
+    threadgroup float row_sum[M];
+    threadgroup float previous_scale[M];
+    const ushort row = thread_index / LanesPerRow;
+    const ushort part = thread_index % LanesPerRow;
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+
+    uint head = group.y;
+    uint query_start = group.x * M;
+    ulong qk_plane = ulong(head) * params.padded_tokens * DQ;
+    device bfloat *q = queries + qk_plane + ulong(query_start) * DQ;
+    device bfloat *k = keys + qk_plane;
+    device bfloat *v = values + ulong(head) * D * params.padded_tokens;
+    device bfloat *out = output +
+        ulong(head) * params.padded_tokens * D + ulong(query_start) * D;
+    uint context = params.tokens;
+    uint tiles = (context + N - 1) / N;
+    const uint2 q_win = params.windowed
+        ? vision_patch_position(min(query_start + uint(row), context - 1), params.grid_width) / 32u
+        : uint2(0u);
+
+    auto qt = tensor(q, dextents<int, 2>{DQ, M}, array<int, 2>{1, DQ});
+    constexpr auto qk_descriptor =
+        matmul2d_descriptor(M, N, DQ, false, true, false);
+    matmul2d<qk_descriptor, execution_simdgroups<Simdgroups>> qk;
+    auto q0 = qt.slice<DQ, M>(0, 0);
+
+    auto pt = tensor(probabilities, dextents<int, 2>{N, M},
+                     array<int, 2>{1, N});
+    auto p0 = pt.slice<N, M>(0, 0);
+    auto st = tensor(score_storage, dextents<int, 2>{N, M},
+                     array<int, 2>{1, N});
+    auto s0 = st.slice<N, M>(0, 0);
+    auto first_v = tensor(v, dextents<int, 2>{D, N},
+                          array<int, 2>{1, D});
+    auto first_v0 = first_v.slice<D, N>(0, 0);
+    constexpr auto pv_descriptor = matmul2d_descriptor(
+        M, D, N, false, false, false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<pv_descriptor, execution_simdgroups<Simdgroups>> pv;
+    auto running = pv.template get_destination_cooperative_tensor<
+        decltype(p0), decltype(first_v0), float>();
+    const bool full =
+        uint(running.get_capacity()) * (Simdgroups * 32u) == uint(M) * D;
+    for (ushort i = 0; i < running.get_capacity(); ++i) {
+        if (full || running.is_valid_element(i))
+            running[i] = 0.0f;
+    }
+    threadgroup const float4 *row_scores =
+        reinterpret_cast<threadgroup const float4 *>(score_storage + row * N);
+    threadgroup bfloat4 *row_probabilities =
+        reinterpret_cast<threadgroup bfloat4 *>(probabilities + row * N);
+    for (uint tile = 0; tile < tiles; ++tile) {
+        device bfloat *tile_k = k + ulong(tile) * N * DQ;
+        auto kt = tensor(tile_k, dextents<int, 2>{DQ, N},
+                         array<int, 2>{1, DQ});
+        auto k0 = kt.slice<DQ, N>(0, 0);
+        auto scores = qk.template get_destination_cooperative_tensor<
+            decltype(q0), decltype(k0), float>();
+        qk.run(q0, k0, scores);
+        scores.store(s0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const int limit = int(context) - int(tile * N);
+        float logits[Runs * 4];
+        float tile_max = -INFINITY;
+        for (ushort r = 0; r < Runs; ++r) {
+            const ushort run = r * LanesPerRow + part;
+            const float4 score = row_scores[run] * params.scale;
+            for (ushort j = 0; j < 4; ++j) {
+                const int key_in_tile = int(run * 4 + j);
+                bool live = key_in_tile < limit;
+                if (live && params.windowed) {
+                    const uint2 k_win = vision_patch_position(tile * N + uint(key_in_tile), params.grid_width) / 32u;
+                    live = all(k_win == q_win);
+                }
+                logits[r * 4 + j] = live ? score[j] : -INFINITY;
+                tile_max = max(tile_max, logits[r * 4 + j]);
+            }
+        }
+        tile_max = max(tile_max, simd_shuffle_xor(tile_max, 1));
+        tile_max = max(tile_max, simd_shuffle_xor(tile_max, 2));
+        const float next_max = max(running_max, tile_max);
+        const float scale = next_max == -INFINITY ? 0.0f : fast::exp(running_max - next_max);
+        float tile_sum = 0.0f;
+        for (ushort r = 0; r < Runs; ++r) {
+            float4 exponents;
+            for (ushort j = 0; j < 4; ++j) {
+                exponents[j] = next_max == -INFINITY ? 0.0f : fast::exp(logits[r * 4 + j] - next_max);
+                tile_sum += exponents[j];
+            }
+            row_probabilities[r * LanesPerRow + part] = bfloat4(exponents);
+        }
+        tile_sum += simd_shuffle_xor(tile_sum, 1);
+        tile_sum += simd_shuffle_xor(tile_sum, 2);
+        running_sum = running_sum * scale + tile_sum;
+        running_max = next_max;
+        if (part == 0) {
+            previous_scale[row] = scale;
+            row_sum[row] = running_sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (ushort i = 0; i < running.get_capacity(); ++i) {
+            if (!full && !running.is_valid_element(i))
+                continue;
+            auto index = running.get_multidimensional_index(i);
+            running[i] *= previous_scale[index[1]];
+        }
+        device bfloat *tile_v = v + ulong(tile) * N * D;
+        auto vt = tensor(tile_v, dextents<int, 2>{D, N},
+                         array<int, 2>{1, D});
+        auto v0 = vt.slice<D, N>(0, 0);
+        pv.run(p0, v0, running);
+    }
+
+    auto ot = tensor(out, dextents<int, 2>{D, M}, array<int, 2>{1, D});
+    auto converted = pv.template get_destination_cooperative_tensor<
+        decltype(p0), decltype(first_v0), bfloat>();
+    for (ushort i = 0; i < running.get_capacity(); ++i) {
+        if (!full && !running.is_valid_element(i))
+            continue;
+        auto index = running.get_multidimensional_index(i);
+        converted[i] = bfloat(running[i] / row_sum[index[1]]);
+    }
+    converted.store(ot.slice<D, M>(0, 0));
+}
+
+kernel void vision_attention_gather_d96(
+    device const bfloat *padded [[buffer(0)]],
+    device bfloat *output [[buffer(1)]],
+    constant VisionQkvParams &params [[buffer(2)]],
+    uint token [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]])
+{
+    device bfloat *row = output + ulong(token) * kMuseVisionHidden;
+    for (uint index = thread_index; index < kMuseVisionHidden; index += 256) {
+        uint head = index / kMuseVisionHeadDim;
+        uint dim = index % kMuseVisionHeadDim;
+        row[index] = padded[
+            (ulong(head) * params.padded_tokens + token) * kMuseVisionHeadDim +
             dim];
     }
 }

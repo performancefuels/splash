@@ -1183,6 +1183,16 @@ def tool_grammar(policy, thinking, response_schema=None, *, chat_format):
     closing = (
         f" {_tags(syntax, syntax.arguments_close)}" if syntax.arguments_close else ""
     )
+    call_open_tag = (
+        syntax.call_open_tag
+        if chat_format.call_open_id is not None
+        else json.dumps(syntax.call_open_tag)
+    )
+    call_close_tag = (
+        syntax.call_close_tag
+        if syntax.tags_are_tokens
+        else json.dumps(syntax.call_close_tag)
+    )
     calls = []
     for index, name in enumerate(policy.schemas):
         arguments = "free_arguments"
@@ -1192,8 +1202,8 @@ def tool_grammar(policy, thinking, response_schema=None, *, chat_format):
                 {"name": arguments, "lark_grammar": strict_arguments[name]}
             )
         calls.append(
-            f"call_{index}: {TOOL_CALL_OPEN} {_function_opening(syntax, name)} "
-            f"@{arguments}{closing} {TOOL_CALL_CLOSE}"
+            f"call_{index}: {call_open_tag} {_function_opening(syntax, name)} "
+            f"@{arguments}{closing} {call_close_tag}"
         )
     call = "(" + " | ".join(f"call_{index}" for index in range(len(calls))) + ")"
     if not calls:
@@ -1218,11 +1228,12 @@ def tool_grammar(policy, thinking, response_schema=None, *, chat_format):
         )
     if think_rule is not None:
         main.append(think_rule)
+    forbidden = f"({re.escape(syntax.call_open_tag)}|{re.escape(chat_format.think_end_tag)})"
     main.extend(
         [
             *calls,
             WHITESPACE_RULE,
-            r"TEXT: /(?s:.*)/ & ~/(?s:.*)(<tool_call>|<\/think>)(?s:.*)/",
+            f"TEXT: /(?s:.*)/ & ~/(?s:.*){forbidden}(?s:.*)/",
         ]
     )
     side_grammars.insert(

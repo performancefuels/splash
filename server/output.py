@@ -54,35 +54,62 @@ class ReasoningSplitter:
 
     def __init__(self, thinking, tool_calls=False, chat_format=None):
         self.reasoning = thinking
+        self.think_start = (
+            chat_format.think_start_tag if chat_format is not None else THINK_START
+        )
+        self.think_end = (
+            chat_format.think_end_tag if chat_format is not None else THINK_END
+        )
+        self.envelope_open = (
+            chat_format.envelope_open if chat_format is not None else None
+        )
+        self.envelope_close = (
+            chat_format.envelope_close if chat_format is not None else None
+        )
         # Whether the output may yet open its reasoning: until it shows
-        # whether it starts with THINK_START.
+        # whether it starts with think_start.
         self.opening = (
             not thinking
             and chat_format is not None
-            and chat_format.think_start_id is not None
+            and (
+                chat_format.think_start_id is not None
+                or chat_format.envelope_open is not None
+            )
         )
         self.pending = ""
-        # Whether the newlines after </think>, which set the answer apart in
-        # the chat template's layout of a turn, are still to be dropped.
+        self.content_pending = ""
+        # Whether the separator after think_end, which sets the answer apart in
+        # the chat template's layout of a turn, is still to be dropped.
         self.separator = False
         self.ends = (
-            (THINK_END, chat_format.call_syntax.call_open)
-            if tool_calls and chat_format.calls_end_reasoning
-            else (THINK_END,)
+            (self.think_end, chat_format.call_syntax.call_open)
+            if tool_calls and chat_format is not None and chat_format.calls_end_reasoning
+            else (self.think_end,)
         )
 
     def put(self, text):
         if self.opening:
             self.pending += text
-            if len(self.pending) < len(THINK_START) and THINK_START.startswith(
+            if len(self.pending) < len(self.think_start) and self.think_start.startswith(
                 self.pending
+            ):
+                return []
+            if (
+                self.envelope_close is not None
+                and self.envelope_close not in self.pending
+                and len(self.pending) < 64
             ):
                 return []
             self.opening = False
             text, self.pending = self.pending, ""
-            if text.startswith(THINK_START):
+            if text.startswith(self.think_start):
                 self.reasoning = True
-                text = text[len(THINK_START) :]
+                text = text[len(self.think_start) :]
+            elif (
+                self.envelope_close is not None
+                and (close := text.find(self.envelope_close)) >= 0
+            ):
+                text = text[close + len(self.envelope_close) :]
         if not self.reasoning:
             return self._content(text)
         self.pending += text
@@ -95,31 +122,80 @@ class ReasoningSplitter:
             end, marker = min(ends)
             reasoning = self.pending[:end]
             content = self.pending[end:]
-            if marker == THINK_END:
-                content = content[len(THINK_END) :]
+            if marker == self.think_end:
+                content = content[len(self.think_end) :]
             self.pending = ""
             self.reasoning = False
-            self.separator = marker == THINK_END
+            self.separator = marker == self.think_end
             output = [("reasoning_content", reasoning)] if reasoning else []
             return output + self._content(content)
         ready, self.pending = hold_partial(self.pending, *self.ends)
         return [("reasoning_content", ready)] if ready else []
 
     def _content(self, text):
+        if self.envelope_open is not None and self.envelope_close is not None:
+            return self._envelope_content(text)
         if self.separator:
             text = text.lstrip("\n")
             if not text:
                 return []
             self.separator = False
-        return [("content", text)]
+        return [("content", text)] if text else []
+
+    def _envelope_content(self, text):
+        self.content_pending += text
+        output = []
+        while self.content_pending:
+            if self.separator:
+                stripped = self.content_pending.lstrip("\n")
+                if not stripped:
+                    self.content_pending = ""
+                    return output
+                if stripped.startswith(self.envelope_open):
+                    close = stripped.find(self.envelope_close, len(self.envelope_open))
+                    if close < 0:
+                        if len(stripped) < 128:
+                            self.content_pending = stripped
+                            return output
+                    else:
+                        self.content_pending = stripped[
+                            close + len(self.envelope_close) :
+                        ]
+                        self.separator = False
+                        continue
+                elif self.envelope_open.startswith(stripped):
+                    self.content_pending = stripped
+                    return output
+                self.content_pending = stripped
+                self.separator = False
+            index = self.content_pending.find(self.think_end)
+            if index >= 0:
+                if index > 0:
+                    output.append(("content", self.content_pending[:index]))
+                self.content_pending = self.content_pending[
+                    index + len(self.think_end) :
+                ]
+                self.separator = True
+                continue
+            ready, self.content_pending = hold_partial(
+                self.content_pending, self.think_end
+            )
+            if ready:
+                output.append(("content", ready))
+            break
+        return output
 
     def finish(self):
-        if not self.pending:
-            return []
-        kind = "reasoning_content" if self.reasoning else "content"
-        text, self.pending = self.pending, ""
-        return [(kind, text)]
-
+        output = []
+        if self.pending:
+            kind = "reasoning_content" if self.reasoning else "content"
+            text, self.pending = self.pending, ""
+            output.append((kind, text))
+        if self.content_pending:
+            text, self.content_pending = self.content_pending, ""
+            if not self.separator:
+                output.append(("content", text))
+        return output
 
 _NOT_JSON = object()
 # A template that writes a value through Jinja's string filter, as Nex's and
@@ -471,11 +547,20 @@ class StreamingToolCallProjector:
                 self.pending = self.pending[start + len(syntax.value_close) :]
                 continue
             if self.state == "closing":
-                # After </function>, the template closes the call's block.
+                # After </function> or </atem:invoke>, the template closes the
+                # call's block or opens the next parallel invoke inside it.
                 rest = self.pending.lstrip(NAME_SPACE)
-                if rest.startswith(TOOL_CALL_CLOSE):
-                    self.pending = rest[len(TOOL_CALL_CLOSE) :]
-                elif TOOL_CALL_CLOSE.startswith(rest):
+                close = syntax.call_close_tag if syntax is not None else TOOL_CALL_CLOSE
+                next_call = syntax.name_open.lstrip(NAME_SPACE) if syntax is not None else ""
+                if rest.startswith(close):
+                    self.pending = rest[len(close) :]
+                elif close.startswith(rest):
+                    break
+                elif next_call and rest.startswith(next_call):
+                    self.pending = rest[len(next_call) :]
+                    self.state = "name"
+                    continue
+                elif next_call and next_call.startswith(rest):
                     break
                 self.state = "content"
         return events

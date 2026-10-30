@@ -71,12 +71,16 @@ PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv2_g16, 2, 16, 256, 0, int8_t)
 // of the 512 keys before each row.
 PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv4_g8_d128, 4, 8, 128, 0, int8_t)
 PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv4_g8_d128_w512, 4, 8, 128, 512, int8_t)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv2_g16_d128, 2, 16, 128, 0, int8_t)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv2_g16_d128_w2048, 2, 16, 128, 2048, int8_t)
 // BF16 shares the page loop and reduction, without quantization scales.
 PAGED_VERIFY_SPLIT(verify_attention_bf16_split, 4, 6, 256, 0, bfloat)
 PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g8, 2, 8, 256, 0, bfloat)
 PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g16, 2, 16, 256, 0, bfloat)
 PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv4_g8_d128, 4, 8, 128, 0, bfloat)
 PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 512, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g16_d128, 2, 16, 128, 0, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g16_d128_w2048, 2, 16, 128, 2048, bfloat)
 #undef PAGED_VERIFY_SPLIT
 
 // Apple7/8 register tile (paged_attention_sgf.h): the bindings and grid of
@@ -97,17 +101,17 @@ PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 512,
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint sg [[simdgroup_index_in_threadgroup]],                              \
       uint lane [[thread_index_in_simdgroup]]) {                               \
-    threadgroup uint query_stage[Group * (HeadDim / 8) * 32];                  \
-    const SplashAttentionTile tile =                                           \
-        splash_verify_attention_tile<Heads, Group, HeadDim>(params[group.z],   \
-                                                            group.x, group.z); \
-    if (!tile.active || group.y >= tile.splits || sg >= Group)                 \
+    PAGED_VERIFY_TILE_AT(Heads, Group, HeadDim)                                \
+    constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS / Parts;                   \
+    constexpr uint Simdgroups = Rows * Group / 8;                              \
+    threadgroup uint query_stage[Simdgroups * (HeadDim / 8) * 32];             \
+    if (sg >= Simdgroups)                                                      \
       return;                                                                  \
-    q8sgf::tile<Heads, Group, HeadDim, Window, CacheElement>(                  \
+    q8sgf::tile<Heads, Group, Rows, HeadDim, Window, CacheElement>(            \
         queries + tile.offset,                                                 \
         SPLASH_LANE_BINDING(group.z, page_table0, page_table1, page_table2,    \
                             page_table3),                                      \
-        params[group.z].kv, group.x, tile.first_position, tile.active_rows,    \
+        params[group.z].kv, kv_head, tile.first_position, tile.active_rows,    \
         tile.splits, group.y, partials, statistics, tile.first_slot + group.y, \
         sg, lane, query_stage);                                                \
   }
@@ -116,10 +120,14 @@ SGF_VERIFY_SPLIT(verify_attention_q8_split_sgf, 4, 6, 256, 0, int8_t)
 SGF_VERIFY_SPLIT(verify_attention_q8_split_sgf_kv2_g8, 2, 8, 256, 0, int8_t)
 SGF_VERIFY_SPLIT(verify_attention_q8_split_sgf_kv4_g8_d128, 4, 8, 128, 0, int8_t)
 SGF_VERIFY_SPLIT(verify_attention_q8_split_sgf_kv4_g8_d128_w512, 4, 8, 128, 512, int8_t)
+SGF_VERIFY_SPLIT(verify_attention_q8_split_sgf_kv2_g16_d128, 2, 16, 128, 0, int8_t)
+SGF_VERIFY_SPLIT(verify_attention_q8_split_sgf_kv2_g16_d128_w2048, 2, 16, 128, 2048, int8_t)
 SGF_VERIFY_SPLIT(verify_attention_bf16_split_sgf, 4, 6, 256, 0, bfloat)
 SGF_VERIFY_SPLIT(verify_attention_bf16_split_sgf_kv2_g8, 2, 8, 256, 0, bfloat)
 SGF_VERIFY_SPLIT(verify_attention_bf16_split_sgf_kv4_g8_d128, 4, 8, 128, 0, bfloat)
 SGF_VERIFY_SPLIT(verify_attention_bf16_split_sgf_kv4_g8_d128_w512, 4, 8, 128, 512, bfloat)
+SGF_VERIFY_SPLIT(verify_attention_bf16_split_sgf_kv2_g16_d128, 2, 16, 128, 0, bfloat)
+SGF_VERIFY_SPLIT(verify_attention_bf16_split_sgf_kv2_g16_d128_w2048, 2, 16, 128, 2048, bfloat)
 #undef SGF_VERIFY_SPLIT
 #undef PAGED_VERIFY_TILE_AT
 #undef PAGED_VERIFY_SCRATCH
@@ -187,5 +195,7 @@ PAGED_VERIFY_REDUCE(verify_attention_reduce_kv2_g8, 2, 8, 256, 0)
 PAGED_VERIFY_REDUCE(verify_attention_reduce_kv2_g16, 2, 16, 256, 0)
 PAGED_VERIFY_SINK_REDUCE(verify_attention_reduce_kv4_g8_d128_sinks, 4, 8, 128, 0)
 PAGED_VERIFY_SINK_REDUCE(verify_attention_reduce_kv4_g8_d128_w512_sinks, 4, 8, 128, 512)
+PAGED_VERIFY_REDUCE(verify_attention_reduce_kv2_g16_d128, 2, 16, 128, 0)
+PAGED_VERIFY_REDUCE(verify_attention_reduce_kv2_g16_d128_w2048, 2, 16, 128, 2048)
 #undef PAGED_VERIFY_SINK_REDUCE
 #undef PAGED_VERIFY_REDUCE

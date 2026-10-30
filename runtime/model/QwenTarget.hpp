@@ -38,6 +38,8 @@ struct Qwen3_8Layout;
 struct Qwen3_8LayerWeights;
 struct Qwen3_6MoeLayout;
 struct Qwen3_6MoeLayerWeights;
+struct MuseGlimmerLayout;
+struct MuseGlimmerLayerWeights;
 
 // Both supported targets bind the same mixer tensors per hybrid layer; only
 // the FFN differs between them.
@@ -402,6 +404,8 @@ void includeFamilyProjections(QwenTargetGeometry &geometry,
                               const QwenTargetWeights<Qwen3_8Layout, Qwen3_8LayerWeights> &weights);
 void includeFamilyProjections(QwenTargetGeometry &geometry,
                               const QwenTargetWeights<Qwen3_6MoeLayout, Qwen3_6MoeLayerWeights> &weights);
+void includeFamilyProjections(QwenTargetGeometry &geometry,
+                              const QwenTargetWeights<MuseGlimmerLayout, MuseGlimmerLayerWeights> &weights);
 
 // The geometry of a target of `weights` whose DFlash2 draft reads the output
 // rows of `captureLayers` (DFlashDraftLayout::targetLayerIds): its layout's,

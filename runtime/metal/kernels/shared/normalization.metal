@@ -54,25 +54,25 @@ inline float add_squares(thread const bfloat (&x)[kNormColumns], float sum) {
 inline float rms_inverse_of(thread const bfloat (&first)[kNormColumns],
                             device const bfloat *row, uint width,
                             threadgroup float *reductions, uint tid, uint lane,
-                            uint sg) {
+                            uint sg, float eps = kRmsEpsilon) {
   float sum = add_squares(first, 0.0f);
   for (uint begin = kNormChunk; begin < width; begin += kNormChunk) {
     bfloat x[kNormColumns];
     load_norm_chunk(row, width, begin, tid, x);
     sum = add_squares(x, sum);
   }
-  return rms_inverse_of_sums(sum, width, reductions, tid, lane, sg);
+  return rms_inverse_of_sums(sum, width, reductions, tid, lane, sg, eps);
 }
 
 template <class W>
 inline void norm_rms_row(device const bfloat *input, device const W *weight,
-                         device bfloat *output, uint width, uint row,
+                         device bfloat *output, uint width, float eps, uint row,
                          uint thread_index, uint lane, uint simd_group,
                          threadgroup float *reductions) {
 #pragma clang fp reassociate(off)
   if (width <= kNormStreamingWidth) {
     const float inverse = rms_inverse(input + row * width, width, reductions,
-                                      thread_index, lane, simd_group);
+                                      thread_index, lane, simd_group, eps);
     for (uint column = thread_index; column < width; column += kNormThreads)
       output[row * width + column] =
           bfloat((float(input[row * width + column]) * inverse) * float(weight[column]));
@@ -84,7 +84,7 @@ inline void norm_rms_row(device const bfloat *input, device const W *weight,
   load_norm_chunk(row_input, width, 0, thread_index, x);
   load_norm_chunk(weight, width, 0, thread_index, w);
   const float inverse_rms = rms_inverse_of(x, row_input, width, reductions,
-                                           thread_index, lane, simd_group);
+                                           thread_index, lane, simd_group, eps);
   for (uint begin = 0; begin < width; begin += kNormChunk) {
     if (begin) {
       load_norm_chunk(row_input, width, begin, thread_index, x);
@@ -98,14 +98,19 @@ inline void norm_rms_row(device const bfloat *input, device const W *weight,
     }
   }
 }
+struct NormRmsParams {
+  uint width;
+  float eps;
+};
+
 #define NORM_RMS(Name, W) \
   kernel void Name(device const bfloat *input [[buffer(0)]], \
       device const W *weight [[buffer(1)]], device bfloat *output [[buffer(2)]], \
-      constant uint &width [[buffer(3)]], uint row [[threadgroup_position_in_grid]], \
+      constant NormRmsParams &params [[buffer(3)]], uint row [[threadgroup_position_in_grid]], \
       uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], \
       uint sg [[simdgroup_index_in_threadgroup]]) { \
     threadgroup float reductions[8]; \
-    norm_rms_row(input, weight, output, width, row, tid, lane, sg, reductions); \
+    norm_rms_row(input, weight, output, params.width, params.eps, row, tid, lane, sg, reductions); \
   }
 NORM_RMS(norm_rms, bfloat)
 NORM_RMS(norm_rms_f32, float)
@@ -126,7 +131,7 @@ static_assert(SPLASH_STAGED_NORM_WIDTH % 4 == 0, "the staged row is a whole numb
 static_assert(SPLASH_STAGED_NORM_THREADS % 256 == 0, "rms_inverse's 256 threads are whole simdgroups");
 template <class WV>
 inline void norm_rms_staged_row(device const bfloat4 *input, device const WV *weight,
-                                device bfloat4 *output, uint width, uint row, uint tid,
+                                device bfloat4 *output, uint width, float eps, uint row, uint tid,
                                 uint lane, uint sg, threadgroup bfloat4 *stage,
                                 threadgroup float *reductions) {
 #pragma clang fp reassociate(off)
@@ -137,19 +142,19 @@ inline void norm_rms_staged_row(device const bfloat4 *input, device const WV *we
   // The first 256 threads reduce the row as rms_inverse does; the other
   // simdgroups' partials are zero and unread.
   const float sum = tid < 256 ? row_squares((threadgroup const bfloat *)stage, width, tid) : 0.0f;
-  const float inverse = rms_inverse_of_sums(sum, width, reductions, tid, lane, sg);
+  const float inverse = rms_inverse_of_sums(sum, width, reductions, tid, lane, sg, eps);
   for (uint column = tid; column < vectors; column += SPLASH_STAGED_NORM_THREADS)
     output[row * vectors + column] = bfloat4((float4(stage[column]) * inverse) * float4(weight[column]));
 }
 #define NORM_RMS_STAGED(Name, WV) \
   [[max_total_threads_per_threadgroup(SPLASH_STAGED_NORM_THREADS)]] kernel void Name(device const bfloat4 *input [[buffer(0)]], \
       device const WV *weight [[buffer(1)]], device bfloat4 *output [[buffer(2)]], \
-      constant uint &width [[buffer(3)]], uint row [[threadgroup_position_in_grid]], \
+      constant NormRmsParams &params [[buffer(3)]], uint row [[threadgroup_position_in_grid]], \
       uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], \
       uint sg [[simdgroup_index_in_threadgroup]]) { \
     threadgroup bfloat4 stage[SPLASH_STAGED_NORM_WIDTH / 4]; \
     threadgroup float reductions[SPLASH_STAGED_NORM_THREADS / 32]; \
-    norm_rms_staged_row(input, weight, output, width, row, tid, lane, sg, stage, reductions); \
+    norm_rms_staged_row(input, weight, output, params.width, params.eps, row, tid, lane, sg, stage, reductions); \
   }
 NORM_RMS_STAGED(norm_rms_staged, bfloat4)
 NORM_RMS_STAGED(norm_rms_staged_f32, packed_float4)
@@ -163,12 +168,12 @@ NORM_RMS_STAGED(norm_rms_staged_f32, packed_float4)
 template <class Table, class W>
 inline void norm_rms_table(device const bfloat *input, device const W *weight,
                            device bfloat *output, device typename Table::Elem *table, device float *sums,
-                           uint width, uint row, uint tid, uint lane, uint sg,
+                           uint width, float eps, uint row, uint tid, uint lane, uint sg,
                            threadgroup float *reductions) {
 #pragma clang fp reassociate(off)
   if (width <= kNormStreamingWidth) {
     device const bfloat *row_input = input + row * width;
-    const float inverse = rms_inverse(row_input, width, reductions, tid, lane, sg);
+    const float inverse = rms_inverse(row_input, width, reductions, tid, lane, sg, eps);
     for (uint g = sg; g < width / 64; g += 8) {
       const uint k = g * 64 + lane * 2;
       const bfloat a = bfloat((float(row_input[k]) * inverse) * float(weight[k]));
@@ -205,7 +210,7 @@ inline void norm_rms_table(device const bfloat *input, device const W *weight,
     }
   };
   load_spans(0);
-  const float inverse = rms_inverse_of(x, row_input, width, reductions, tid, lane, sg);
+  const float inverse = rms_inverse_of(x, row_input, width, reductions, tid, lane, sg, eps);
   for (uint begin = 0; begin < width; begin += kNormChunk) {
     if (begin)
       load_spans(begin);
@@ -227,11 +232,11 @@ inline void norm_rms_table(device const bfloat *input, device const W *weight,
   kernel void Name(device const bfloat *input [[buffer(0)]], \
       device const W *weight [[buffer(1)]], device bfloat *output [[buffer(2)]], \
       device Table::Elem *table [[buffer(3)]], device float *sums [[buffer(4)]], \
-      constant uint &width [[buffer(5)]], uint row [[threadgroup_position_in_grid]], \
+      constant NormRmsParams &params [[buffer(5)]], uint row [[threadgroup_position_in_grid]], \
       uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], \
       uint sg [[simdgroup_index_in_threadgroup]]) { \
     threadgroup float reductions[8]; \
-    norm_rms_table<Table>(input, weight, output, table, sums, width, row, tid, lane, sg, reductions); \
+    norm_rms_table<Table>(input, weight, output, table, sums, params.width, params.eps, row, tid, lane, sg, reductions); \
   }
 // Table16 feeds the register-tile projections, from a GGUF target's F32 norms and from an MLX target's and the
 // draft's bf16 norms.
@@ -240,3 +245,95 @@ NORM_RMS_TABLE(norm_rms_table16_decode_f32, gguf_sg::Table16, float)
 NORM_RMS_TABLE(norm_rms_table16f_decode, gguf_sg::Table16F, bfloat)
 NORM_RMS_TABLE(norm_rms_table16f_decode_f32, gguf_sg::Table16F, float)
 #undef NORM_RMS_TABLE
+
+struct NormRmsResidualParams {
+  uint width;
+  float eps;
+};
+
+template <class W>
+inline void norm_rms_residual_row(device const bfloat *input, device const W *weight,
+                                  device const bfloat *residual, device bfloat *output,
+                                  uint width, float eps, uint row, uint thread_index,
+                                  uint lane, uint simd_group, threadgroup float *reductions) {
+#pragma clang fp reassociate(off)
+  device const bfloat *row_input = input + ulong(row) * width;
+  device const bfloat *row_residual = residual + ulong(row) * width;
+  device bfloat *row_output = output + ulong(row) * width;
+  bfloat x[kNormColumns];
+  W w[kNormColumns];
+  load_norm_chunk(row_input, width, 0, thread_index, x);
+  load_norm_chunk(weight, width, 0, thread_index, w);
+  const float inverse_rms = rms_inverse_of(x, row_input, width, reductions,
+                                           thread_index, lane, simd_group, eps);
+  for (uint begin = 0; begin < width; begin += kNormChunk) {
+    if (begin) {
+      load_norm_chunk(row_input, width, begin, thread_index, x);
+      load_norm_chunk(weight, width, begin, thread_index, w);
+    }
+    for (uint i = 0; i < kNormColumns; ++i) {
+      const uint column = begin + thread_index + kNormThreads * i;
+      if (column < width) {
+        const float normed = float(bfloat((float(x[i]) * inverse_rms) * float(w[i])));
+        row_output[column] = bfloat(normed + float(row_residual[column]));
+      }
+    }
+  }
+}
+
+#define NORM_RMS_RESIDUAL(Name, W) \
+  kernel void Name(device const bfloat *input [[buffer(0)]], \
+      device const W *weight [[buffer(1)]], device const bfloat *residual [[buffer(2)]], \
+      device bfloat *output [[buffer(3)]], constant NormRmsResidualParams &params [[buffer(4)]], \
+      uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+      uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) { \
+    threadgroup float reductions[8]; \
+    norm_rms_residual_row(input, weight, residual, output, params.width, params.eps, row, tid, lane, sg, reductions); \
+  }
+NORM_RMS_RESIDUAL(norm_rms_residual, bfloat)
+
+kernel void norm_rms_unit(device const bfloat *input [[buffer(0)]],
+                          device bfloat *output [[buffer(1)]],
+                          constant NormRmsParams &params [[buffer(2)]],
+                          uint row [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]]) {
+#pragma clang fp reassociate(off)
+  threadgroup float reductions[8];
+  device const bfloat *row_input = input + ulong(row) * params.width;
+  device bfloat *row_output = output + ulong(row) * params.width;
+  bfloat x[kNormColumns];
+  load_norm_chunk(row_input, params.width, 0, tid, x);
+  const float inverse_rms = rms_inverse_of(x, row_input, params.width, reductions,
+                                           tid, lane, sg, params.eps);
+  for (uint begin = 0; begin < params.width; begin += kNormChunk) {
+    if (begin)
+      load_norm_chunk(row_input, params.width, begin, tid, x);
+    for (uint i = 0; i < kNormColumns; ++i) {
+      const uint column = begin + tid + kNormThreads * i;
+      if (column < params.width)
+        row_output[column] = bfloat(float(x[i]) * inverse_rms);
+    }
+  }
+}
+NORM_RMS_RESIDUAL(norm_rms_residual_f32, float)
+#undef NORM_RMS_RESIDUAL
+
+struct LogitSoftcapParams {
+  uint count;
+  float scale;
+  float softcap;
+};
+
+kernel void logit_scale_softcap(device float *logits [[buffer(0)]],
+                                constant LogitSoftcapParams &params [[buffer(1)]],
+                                uint index [[thread_position_in_grid]],
+                                uint grid_size [[threads_per_grid]]) {
+  for (uint i = index; i < params.count; i += grid_size) {
+    float v = logits[i] * params.scale;
+    if (params.softcap > 0.0f)
+      v = params.softcap * precise::tanh(v / params.softcap);
+    logits[i] = v;
+  }
+}

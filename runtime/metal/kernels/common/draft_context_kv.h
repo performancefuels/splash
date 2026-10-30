@@ -12,7 +12,8 @@ inline void draft_context_kv_phase(
     device bfloat *keys, device bfloat *values, uint start_position,
     uint active_tokens, uint task,
     uint thread_index, uint lane, uint simd_group,
-    threadgroup float *reductions, threadgroup bfloat *normalized) {
+    threadgroup float *reductions, threadgroup bfloat *normalized,
+    float eps = kRmsEpsilon) {
   constexpr uint KVHeads = SPLASH_DRAFT_KV_HEADS, HeadDim = SPLASH_DRAFT_HEAD_DIMENSION,
                  Window = SPLASH_DRAFT_SLIDING_WINDOW;
   constexpr uint KWidth = KVHeads * HeadDim, RowWidth = 2 * KWidth;
@@ -30,7 +31,7 @@ inline void draft_context_kv_phase(
   float element = thread_index < HeadDim ? float(source[thread_index]) : 0.0f;
   const float inverse = rms_inverse_of_sums(element * element, HeadDim,
                                             reductions, thread_index, lane,
-                                            simd_group);
+                                            simd_group, eps);
   if (thread_index < HeadDim) {
     normalized[thread_index] =
         bfloat(element * inverse * float(k_norm[thread_index]));

@@ -60,3 +60,14 @@ struct VisionAttentionParams {
 
 static_assert(sizeof(VisionAttentionParams) == 12,
               "Vision attention parameters are 12 bytes on both sides");
+
+struct MuseVisionAttentionParams {
+  uint32_t tokens;
+  uint32_t padded_tokens;
+  float scale;
+  uint32_t grid_width;
+  uint32_t windowed;
+};
+
+static_assert(sizeof(MuseVisionAttentionParams) == 20,
+              "Muse vision attention parameters are 20 bytes on both sides");

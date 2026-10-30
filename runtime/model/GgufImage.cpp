@@ -121,6 +121,60 @@ public:
     image_.repack(std::move(repack));
   }
 
+  // Muse Glimmer's separate q and gate tensors [heads * headDim, columns],
+  // interleaved per head into [2 * heads * headDim, columns], with qOrder
+  // applied to each query head's headDim rows.
+  void interleavedQGate(const std::string &qName, const std::string &gateName, uint32_t heads, uint32_t headDim,
+                        uint64_t columns, RowOrder qOrder) {
+    const GgufTensor *qTensor = find(qName, quantizedType), *gateTensor = find(gateName, quantizedType);
+    if (!qTensor || !gateTensor) return;
+    const uint64_t rows = uint64_t{heads} * headDim;
+    if (qTensor->rows() != rows || qTensor->columns() != columns)
+      throw GgufError("unexpected shape for " + qName);
+    if (gateTensor->rows() != rows || gateTensor->columns() != columns)
+      throw GgufError("unexpected shape for " + gateName);
+    if (qTensor->type != gateTensor->type)
+      throw GgufError(qName + " and " + gateName + " differ in quantization type");
+    const uint32_t format = imageFormat(qTensor->type);
+    const uint64_t rowBytes = ggufRowBytes(kQuantFormats[format], columns);
+    const TensorRows qAll = tensorRows(*qTensor, rows, rowBytes, qOrder);
+    const TensorRows gAll = tensorRows(*gateTensor, rows, rowBytes);
+    Repack repack = image_.planes(format, 2 * rows, columns, qName);
+    for (uint32_t h = 0; h < heads; ++h) {
+      TensorRows qHead = qAll;
+      qHead.first = uint64_t{h} * headDim;
+      qHead.rows = headDim;
+      repack.sources.push_back(std::move(qHead));
+      TensorRows gHead = gAll;
+      gHead.first = uint64_t{h} * headDim;
+      gHead.rows = headDim;
+      repack.sources.push_back(std::move(gHead));
+    }
+    image_.repack(std::move(repack));
+  }
+
+  // A quantized [heads * headDim, columns] tensor whose rows are permuted
+  // within each headDim-row head by `order`.
+  void perHeadQuantized(const std::string &name, uint32_t heads, uint32_t headDim, uint64_t columns,
+                        RowOrder order) {
+    const GgufTensor *tensor = find(name, quantizedType);
+    if (!tensor) return;
+    const uint64_t rows = uint64_t{heads} * headDim;
+    if (tensor->rows() != rows || tensor->columns() != columns)
+      throw GgufError("unexpected shape for " + name);
+    const uint32_t format = imageFormat(tensor->type);
+    const uint64_t rowBytes = ggufRowBytes(kQuantFormats[format], columns);
+    const TensorRows all = tensorRows(*tensor, rows, rowBytes, order);
+    Repack repack = image_.planes(format, rows, columns, name);
+    for (uint32_t h = 0; h < heads; ++h) {
+      TensorRows slice = all;
+      slice.first = uint64_t{h} * headDim;
+      slice.rows = headDim;
+      repack.sources.push_back(std::move(slice));
+    }
+    image_.repack(std::move(repack));
+  }
+
   // Rows [N, K] as quantized() repacks them, but of a BF16 or F16 tensor
   // as the Q8_0 rows the reference quantize_row_q8_0_ref writes from its
   // values, which the writer quantizes (TensorRows::ggufFloatRowBytes).
@@ -626,12 +680,61 @@ struct FlintGguf final {
                      std::vector<Image> &) {}
 };
 
+// Muse Glimmer's GGUFs (muse-glimmer): 52 dense attention layers, 3 sliding
+// + 1 full-attention repeating, with separate attn_q and attn_gate tensors,
+// Q/K permuted for NORM RoPE in the GGUF (inverted back to NeoX rotate_half
+// per head), pre/post attention and FFN norms, and scaled/softcapped logits.
+struct MuseGlimmerGguf final {
+  static constexpr std::string_view architecture = "muse-glimmer";
+
+  template <class Expect, class ExpectFloat>
+  static void metadata(const Expect &expect, const ExpectFloat &expectFloat, const QwenTargetDimensions &g) {
+    expect("attention.sliding_window", g.slidingWindow);
+    expectFloat("logit_scale", g.logitScale);
+    expectFloat("final_logit_softcapping", g.finalLogitSoftcap);
+  }
+
+  static void arrays(const GgufFile &file, const QwenTargetDimensions &g) {
+    const std::string key = std::string(architecture) + ".attention.sliding_window_pattern";
+    if (const auto period = file.metadata().unsignedValue(key)) {
+      if (*period == 4) return;
+    }
+    const auto values = file.numericArray(key);
+    bool matches = values && values->size() == g.layers;
+    for (uint32_t layer = 0; matches && layer < g.layers; ++layer)
+      matches = (*values)[layer] == double(layer < 64 && (g.slidingLayers >> layer & 1));
+    if (!matches)
+      throw GgufError("GGUF metadata does not match the target: attention.sliding_window_pattern");
+  }
+
+  static void layer(Builder &b, const QwenTargetDimensions &g, uint32_t index) {
+    const std::string p = prefix(index);
+    const RowOrder neoxOrder{.from = 0, .headRows = 1, .keyHeads = 2, .valueHeadsPerKey = g.attentionHeadDimension / 2};
+    b.floatNorm(p + "attn_norm.weight", g.hiddenSize);
+    b.interleavedQGate(p + "attn_q.weight", p + "attn_gate.weight", g.attentionQueryHeads, g.attentionHeadDimension,
+                       g.hiddenSize, neoxOrder);
+    b.perHeadQuantized(p + "attn_k.weight", g.attentionKvHeads, g.attentionHeadDimension, g.hiddenSize, neoxOrder);
+    b.quantized(p + "attn_v.weight", uint64_t{g.attentionKvHeads} * g.attentionHeadDimension, g.hiddenSize);
+    b.floatNorm(p + "attn_q_norm.weight", g.attentionHeadDimension);
+    b.floatNorm(p + "attn_k_norm.weight", g.attentionHeadDimension);
+    b.quantized(p + "attn_output.weight", g.hiddenSize, g.attentionWidth);
+    b.floatNorm(p + "post_attention_norm.weight", g.hiddenSize);
+    b.floatNorm(p + "ffn_norm.weight", g.hiddenSize);
+    ffnImage(b, g, p, index);
+    b.floatNorm(p + "post_ffw_norm.weight", g.hiddenSize);
+  }
+  static void head(Builder &b, const QwenTargetDimensions &g) { b.floatNorm("output_norm.weight", g.hiddenSize); }
+  static void tables(const GgufFile &, const QwenTargetDimensions &, PlanOptions, std::vector<std::string> &,
+                     std::vector<Image> &) {}
+};
+
 // Calls `use` with what the GGUFs of `architecture` hold: Qwen3.8-Flash-Next's
 // (Qwen4ExpGguf), Flint's (FlintGguf), or else the Qwen3.5 hybrid's
 // (HybridGguf).
 template <class Use> decltype(auto) withFamily(std::string_view architecture, Use &&use) {
   if (architecture == Qwen4ExpGguf::architecture) return use(Qwen4ExpGguf{});
   if (architecture == FlintGguf::architecture) return use(FlintGguf{});
+  if (architecture == MuseGlimmerGguf::architecture) return use(MuseGlimmerGguf{});
   return use(HybridGguf{});
 }
 
@@ -837,7 +940,7 @@ void requireMetadata(const GgufMetadata &metadata, std::string_view architecture
       metadata.unsignedValue(arch + ".rope.dimension_count"))
     expect("rope.dimension_count", 2ull * geometry.rotaryPairs);
   expectFloat("rope.freq_base", geometry.rotaryTheta);
-  expectFloat("attention.layer_norm_rms_epsilon", SPLASH_RMS_EPSILON);
+  expectFloat("attention.layer_norm_rms_epsilon", geometry.rmsEpsilon);
   if (const auto scaling = metadata.stringValue(arch + ".rope.scaling.type"); scaling && *scaling != "none")
     mismatched += (mismatched.empty() ? "" : ", ") + std::string("rope.scaling.type ") + *scaling + " (expected none)";
   if (geometry.gdnLayerCount()) {

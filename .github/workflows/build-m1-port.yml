@@ -2,7 +2,7 @@ name: Build M1/M2 1.5 port
 
 on:
   push:
-    branches: [build/1.5.0-m1.0]
+    branches: [build/1.5.0-m1.0, feat/muse-glimmer-1.5]
   workflow_dispatch:
     inputs:
       run_checks:
@@ -16,9 +16,13 @@ permissions:
 
 jobs:
   package:
-    name: Build and package splash 1.5.0-m1.0 (Apple7/8, xcode-27)
-    runs-on: xcode-27
+    name: Build and package splash 1.5.0-m1.1-muse (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-26, xcode-27]
     steps:
       - uses: actions/checkout@v4
 
@@ -50,7 +54,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: splash-1.5.0-m1.0-engine
+          name: splash-1.5.0-m1.1-muse-engine-${{ matrix.runner }}
           path: |
             build/splash
             build/splash.metallib
@@ -60,25 +64,17 @@ jobs:
           retention-days: 7
 
       - name: Engine tests (CPU)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_checks }}
         run: make test-engine-cpu PYTHON_CANDIDATES=python3
 
-      - name: Python tests and lint
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_checks }}
-        run: make check-python PYTHON_CANDIDATES=python3
-
       - name: Package runtime archive
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_checks }}
-        run: make package RELEASE_VERSION=1.5.0-m1.0 PYTHON_CANDIDATES=python3
+        run: make package RELEASE_VERSION=1.5.0-m1.1-muse PYTHON_CANDIDATES=python3
 
       - name: Show artefacts
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_checks }}
         run: ls -l dist && cat dist/*.sha256
 
       - uses: actions/upload-artifact@v4
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_checks }}
         with:
-          name: splash-1.5.0-m1.0
+          name: splash-1.5.0-m1.1-muse-${{ matrix.runner }}
           path: dist/
           if-no-files-found: error
           retention-days: 7

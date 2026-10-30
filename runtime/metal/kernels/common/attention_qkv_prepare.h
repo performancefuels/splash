@@ -51,9 +51,10 @@ inline void full_qkv_storage_phase(
   }
 
   float element = float(source[thread_index]);
+  constexpr float qk_eps = (QHeads == 32 && KHeads == 2 && HeadDim == 128 && Gated) ? 1e-5f : kRmsEpsilon;
   const float inverse = rms_inverse_of_sums<HeadDim / 32>(element * element, HeadDim,
                                                           reductions, thread_index, lane,
-                                                          simd_group);
+                                                          simd_group, qk_eps);
   normalized[thread_index] =
       bfloat(element * inverse * float(weight[thread_index]));
   if (!query) {

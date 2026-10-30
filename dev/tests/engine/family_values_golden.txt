@@ -78,3 +78,15 @@ namespace bf16 fp32 b06e435b51f8c94636cf3a72acdcfc26
 state bf16 cell 0 lane 10747904 cached 2359296
 namespace int8 bf16 b0dbac8e4f941ecd3e28c87cc3d2c58a
 namespace bf16 bf16 b06e435b51f8c94636cf3a72acdcfc26
+family Muse-Glimmer-30B
+kv layers 52 heads 2 dimension 128 index 0 window 2047 layers 0x7777777777777
+kv int8 page 878592 index-page 0 slim-page 219648 alignment 256 extents 256..256
+kv int8 extent-pages 1:0 31:0 32:0 63:0 64:0 127:0 128:0 129:0 255:0 256:256 257:256 511:256 512:256 1000:256 4095:256 4096:256 10000:256 65535:256 65536:256 100000:256 262144:256 1000000:256
+kv bf16 page 1703936 index-page 0 slim-page 425984 alignment 4 extents 40..116
+kv bf16 extent-pages 1:0 31:0 32:0 63:60 64:64 127:60 128:64 129:64 255:84 256:64 257:64 511:84 512:64 1000:100 4095:44 4096:64 10000:80 65535:80 65536:64 100000:80 262144:64 1000000:80
+state fp32 cell 0 lane 49610752 cached 7667712
+namespace int8 fp32 16699e56dad91ed01cd8b3d1adbd08d9
+namespace bf16 fp32 314ff29533ce78e961b72d2c4cdc996f
+state bf16 cell 0 lane 49610752 cached 7667712
+namespace int8 bf16 16699e56dad91ed01cd8b3d1adbd08d9
+namespace bf16 bf16 314ff29533ce78e961b72d2c4cdc996f

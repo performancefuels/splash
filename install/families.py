@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from server.chat_format import FLINT, QWEN, ChatFormat
+from server.chat_format import FLINT, MUSE_GLIMMER, QWEN, ChatFormat
 
 
 @dataclass(frozen=True)
@@ -42,6 +42,7 @@ FAMILIES = (
     ModelFamily("Qwen3.8-Flash-Next", "incoai/Qwen3.8-Flash-Next-DFlash2", QWEN),
     # It has no vision tower.
     ModelFamily("Flint", "incoai/Flint-DFlash2", FLINT, vision=False),
+    ModelFamily("Muse-Glimmer-30B", "incoai/Muse-Glimmer-30B-DFlash2", MUSE_GLIMMER),
 )
 
 

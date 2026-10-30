@@ -110,6 +110,10 @@ struct QwenTargetDimensions {
   uint32_t pleHeadsPerNgram = 0;
   uint32_t pleHeadDimension = 0;
   uint32_t pleConvolutionTaps = 0;
+  double rmsEpsilon = SPLASH_RMS_EPSILON;
+  float postNormEpsilon = 0.0F;
+  float logitScale = 0.0F;
+  float finalLogitSoftcap = 0.0F;
 
   [[nodiscard]] constexpr bool
   isFullAttentionLayer(uint32_t layer) const noexcept {

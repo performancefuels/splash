@@ -529,8 +529,12 @@ struct Runtime::Impl {
   // Qwen3.5 M-RoPE: text rows advance one counter shared by all three axes;
   // an image's rows spread over (t, h, w) from the counter at the image start
   // and the counter then advances by max(merged height, merged width).
-  static std::array<uint32_t, 3> ropePosition(const Request &entry,
-                                              uint64_t logical) {
+  std::array<uint32_t, 3> ropePosition(const Request &entry,
+                                       uint64_t logical) const {
+    if (geometry.target.rotaryPairs * 2 == geometry.target.attentionHeadDimension) {
+      const auto pos = static_cast<uint32_t>(logical);
+      return {pos, pos, pos};
+    }
     int64_t delta = 0;
     for (const ImageState &image : entry.images) {
       const ImageSpan &span = image.span;
@@ -1510,8 +1514,8 @@ struct Runtime::Impl {
 
   // A request as the target reads it beyond a step's rows: its tokens, a
   // prefill's its prompt, and their RoPE positions.
-  static QwenTargetRequest targetRequest(const Request &entry) {
-    return {entry.tokens, [&entry](uint64_t logical) { return ropePosition(entry, logical); }};
+  QwenTargetRequest targetRequest(const Request &entry) const {
+    return {entry.tokens, [this, &entry](uint64_t logical) { return ropePosition(entry, logical); }};
   }
 
   // The states a sequence of `rows` rows captures inside them, in their

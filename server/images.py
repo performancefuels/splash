@@ -74,7 +74,9 @@ def max_patches(max_pixels: int) -> int:
     return max_pixels // (PATCH * PATCH) // 4 * 4
 
 
-def smart_resize(height: int, width: int, max_pixels: int) -> tuple[int, int]:
+def smart_resize(
+    height: int, width: int, max_pixels: int, patch_size: int = PATCH
+) -> tuple[int, int]:
     """Upstream Qwen2VL smart-resize: patch/merge-aligned sides inside the
     pixel budget with the aspect ratio preserved as closely as possible."""
     if height <= 0 or width <= 0:
@@ -83,27 +85,30 @@ def smart_resize(height: int, width: int, max_pixels: int) -> tuple[int, int]:
         raise ImageError("invalid image pixel budget")
     if max(height, width) / min(height, width) > 200:
         raise ImageError("absolute aspect ratio must be smaller than 200")
-    h_bar = round(height / FACTOR) * FACTOR
-    w_bar = round(width / FACTOR) * FACTOR
+    factor = patch_size * MERGE
+    h_bar = round(height / factor) * factor
+    w_bar = round(width / factor) * factor
     if h_bar * w_bar > max_pixels:
         beta = math.sqrt((height * width) / max_pixels)
-        h_bar = max(FACTOR, math.floor(height / beta / FACTOR) * FACTOR)
-        w_bar = max(FACTOR, math.floor(width / beta / FACTOR) * FACTOR)
+        h_bar = max(factor, math.floor(height / beta / factor) * factor)
+        w_bar = max(factor, math.floor(width / beta / factor) * factor)
     elif h_bar * w_bar < MIN_PIXELS:
         beta = math.sqrt(MIN_PIXELS / (height * width))
-        h_bar = math.ceil(height * beta / FACTOR) * FACTOR
-        w_bar = math.ceil(width * beta / FACTOR) * FACTOR
+        h_bar = math.ceil(height * beta / factor) * factor
+        w_bar = math.ceil(width * beta / factor) * factor
     # Upscaling to the minimum can also overshoot a small serving cap after
     # alignment. The hard cap takes precedence over that soft minimum.
     while h_bar * w_bar > max_pixels:
-        if h_bar >= w_bar and h_bar > FACTOR:
-            h_bar -= FACTOR
+        if h_bar >= w_bar and h_bar > factor:
+            h_bar -= factor
         else:
-            w_bar -= FACTOR
+            w_bar -= factor
     return h_bar, w_bar
 
 
-def prepare(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedImage:
+def prepare(
+    payload: bytes, max_pixels: int = MAX_PIXELS, patch_size: int = PATCH
+) -> PreparedImage:
     """Decode, convert to RGB, resize into the grid, and digest the pixels."""
     from PIL import Image, ImageOps
 
@@ -112,7 +117,9 @@ def prepare(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedImage:
             if decoded.height * decoded.width > MAX_SOURCE_PIXELS:
                 raise ImageError("source image exceeds the pixel limit")
             stored = decoded.size
-            height, width = smart_resize(decoded.height, decoded.width, max_pixels)
+            height, width = smart_resize(
+                decoded.height, decoded.width, max_pixels, patch_size=patch_size
+            )
             try:
                 # Cameras store the sensor's orientation and an EXIF tag that
                 # turns it upright for display; show the model the upright one.
@@ -130,13 +137,21 @@ def prepare(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedImage:
             else:
                 image = decoded.convert("RGB")
             if (image.height, image.width) != (height, width):
-                image = image.resize((width, height), Image.Resampling.BICUBIC)
+                resample = (
+                    Image.Resampling.LANCZOS
+                    if patch_size == 14
+                    else Image.Resampling.BICUBIC
+                )
+                image = image.resize((width, height), resample)
             pixels = image.tobytes()
     except ImageError:
         raise
     except Exception as error:
         raise ImageError("image could not be decoded") from error
-    grid_height, grid_width = height // PATCH, width // PATCH
+    grid_height, grid_width = height // patch_size, width // patch_size
+    wire_bytes = grid_height * PATCH * grid_width * PATCH * 3
+    if len(pixels) < wire_bytes:
+        pixels = pixels + bytes(wire_bytes - len(pixels))
     digest = hashlib.sha256(struct.pack("<II", grid_height, grid_width) + pixels)
     digest_lo, digest_hi = struct.unpack_from("<QQ", digest.digest())
     return PreparedImage(grid_height, grid_width, pixels, digest_lo, digest_hi)
@@ -186,13 +201,17 @@ class ImageCache:
     def request_batch(self):
         return PreparedImages(self)
 
-    def prepare(self, payload: bytes, max_pixels: int) -> PreparedImage:
-        key = hashlib.sha256(struct.pack("<I", max_pixels) + payload).digest()
+    def prepare(
+        self, payload: bytes, max_pixels: int, patch_size: int = PATCH
+    ) -> PreparedImage:
+        key = hashlib.sha256(
+            struct.pack("<II", max_pixels, patch_size) + payload
+        ).digest()
         with self._lock:
             cached = self._entries.get(key)
         if cached is not None:
             return cached
-        prepared = prepare(payload, max_pixels)
+        prepared = prepare(payload, max_pixels, patch_size=patch_size)
         with self._lock:
             self._entries.put(key, prepared, len(prepared.pixels))
         return prepared

@@ -373,6 +373,18 @@ void validateTextConfig(NSDictionary *text, const FlintLayout &target, TargetSou
     if (text[@(key)]) requireBooleans(text, "text config", {{key, false}});
 }
 
+void validateTextConfig(NSDictionary *text, const MuseGlimmerLayout &target, TargetSource source) {
+  const std::string_view name = sourceName(source);
+  if (const auto difference = sizeDifference(text, target, source)) throw unsupportedModel(difference->difference);
+  requireNumbers(text, name, "text config",
+                 {{"intermediate_size", target.intermediateSize},
+                  {"sliding_window", target.slidingWindow}});
+  requireLayerTypes(requireArray(text, @"layer_types", "text config layer_types"), target, name,
+                    "text config layer_types");
+  if (text[@"rms_norm_eps"]) requireNumbers(text, name, "text config", {{"rms_norm_eps", target.rmsEpsilon}});
+  if (text[@"post_norm_eps"]) requireNumbers(text, name, "text config", {{"post_norm_eps", target.postNormEpsilon}});
+}
+
 // The mask token a DFlash2 draft of a family whose drafts choose theirs
 // names (dflash_config.mask_token_id), which must be one of the target's
 // reserved tokens; readDraftLayout then holds the draft to it.
@@ -673,7 +685,7 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
                   {"num_key_value_heads", SPLASH_DRAFT_KV_HEADS},
                   {"head_dim", SPLASH_DRAFT_HEAD_DIMENSION},
                   {"sliding_window", ExecutionLimits::draftContextTokens},
-                  {"rms_norm_eps", SPLASH_RMS_EPSILON}});
+                  {"rms_norm_eps", target.rmsEpsilon}});
   requireBooleans(draft, "draft config",
                   {{"is_causal", false},
                    {"attention_bias", false},
@@ -717,12 +729,15 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
     if (targetLayers.back() >= target.layers)
       throw std::invalid_argument("draft config target_layer_ids names a layer past the target's");
   }
-  const DFlashDraftLayout layout =
+  DFlashDraftLayout layout =
       draftLayout(target.hiddenSize, target.vocabularySize,
                   requireWhole(draft[@"num_hidden_layers"], "draft config num_hidden_layers"),
                   requireWhole(draft[@"intermediate_size"], "draft config intermediate_size"),
                   requireNumber(rope[@"rope_theta"], "draft config rope_parameters rope_theta").floatValue,
                   targetLayers);
+  layout.rmsEpsilon = static_cast<float>(target.rmsEpsilon);
+  layout.logitScale = target.logitScale;
+  layout.finalLogitSoftcap = target.finalLogitSoftcap;
   return layout;
 }
 
@@ -739,12 +754,14 @@ void validateVisionConfig(NSDictionary *vision, const ops::VisionLayout &layout,
                   {"out_hidden_size", layout.outputHiddenSize},
                   {"patch_size", layout.patchSize},
                   {"spatial_merge_size", layout.spatialMerge},
-                  {"temporal_patch_size", 2},
+                  {"temporal_patch_size", layout.temporalPatchSize},
                   {"in_channels", ops::kImageChannels},
                   {"num_position_embeddings", layout.positionGridSide * layout.positionGridSide}});
-  requireEqual(requireString(vision, @"hidden_act", "vision config hidden_act"), "gelu_pytorch_tanh",
+  const std::string_view expectedAct = layout.museTower ? "gelu" : "gelu_pytorch_tanh";
+  requireEqual(requireString(vision, @"hidden_act", "vision config hidden_act"), expectedAct,
                sourceName(source), "vision config hidden_act");
-  if (requireArray(vision, @"deepstack_visual_indexes", "vision config deepstack_visual_indexes").count)
+  if (vision[@"deepstack_visual_indexes"] &&
+      requireArray(vision, @"deepstack_visual_indexes", "vision config deepstack_visual_indexes").count)
     throw std::invalid_argument("vision deepstack layers are unsupported");
 }
 
@@ -802,9 +819,12 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
     if (draft && layout.draftChoosesMaskToken()) layout.maskToken = draftMaskToken(draft, layout);
     if (draft) dflashLayout = readDraftLayout(draft, layout);
   }, *target);
-  ModelDescriptor result = makeModelDescriptor(std::move(name), *target, dflashLayout,
-                                               {.outputHiddenSize = std::visit(
-                                                    [](const auto &layout) { return layout.hiddenSize; }, *target)},
+  ops::VisionLayout visionLayout =
+      std::holds_alternative<MuseGlimmerLayout>(*target)
+          ? ops::VisionLayout::museGlimmer()
+          : ops::VisionLayout{.outputHiddenSize =
+                                  std::visit([](const auto &layout) { return layout.hiddenSize; }, *target)};
+  ModelDescriptor result = makeModelDescriptor(std::move(name), *target, dflashLayout, visionLayout,
                                                targetSource, visionSource);
   if (result.hasVision())
     validateVisionConfig(requireObject(config, @"vision_config", "vision config"), result.vision,

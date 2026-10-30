@@ -2,6 +2,7 @@
 
 #include "model/DFlashDraft.hpp"
 #include "model/Flint.hpp"
+#include "model/MuseGlimmer.hpp"
 #include "model/Qwen3_6Moe.hpp"
 #include "model/Qwen3_8.hpp"
 #include "model/Qwen4Exp.hpp"
@@ -43,6 +44,11 @@ namespace splash::test {
   constexpr model::FlintLayout target;
   constexpr std::array<uint32_t, 5> targetLayers{1, 12, 24, 35, 47};
   return model::draftLayout(target.hiddenSize, target.vocabularySize, 1, 6144, 10'000'000.0F, targetLayers);
+}
+[[nodiscard]] inline model::DFlashDraftLayout museGlimmerDraft() {
+  constexpr model::MuseGlimmerLayout target;
+  constexpr std::array<uint32_t, 5> targetLayers{1, 13, 25, 38, 50};
+  return model::draftLayout(target.hiddenSize, target.vocabularySize, 5, 19968, 500'000.0F, targetLayers);
 }
 
 // The vision tower of Qwen3.8-27B, projecting into its hidden width.

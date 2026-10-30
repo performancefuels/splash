@@ -35,18 +35,20 @@ class ToolCallSyntax:
     value_open: str
     value_close: str
     arguments_close: str
+    call_open_tag: str = TOOL_CALL_OPEN
+    call_close_tag: str = TOOL_CALL_CLOSE
     # Whether each of its tags is a token of the family's tokenizer, as
-    # TOOL_CALL_OPEN and TOOL_CALL_CLOSE are in every family's, which grammars
+    # TOOL_CALL_OPEN and TOOL_CALL_CLOSE are in Qwen and Flint, which grammars
     # then write as that token; otherwise they write the tags as text.
     tags_are_tokens: bool
 
     @property
     def call_open(self):
         """The text a call opens with, up to its function's name."""
-        return TOOL_CALL_OPEN + self.name_open
+        return self.call_open_tag + self.name_open
 
     def function_opening(self, name):
-        """What follows TOOL_CALL_OPEN in a call of tool `name`, up to its
+        """What follows call_open_tag in a call of tool `name`, up to its
         arguments."""
         return f"{self.name_open}{name}{self.name_close}"
 
@@ -64,7 +66,7 @@ class ToolCallSyntax:
         the call's close a model may write without the arguments'."""
         return tuple(
             tag
-            for tag in (self.key_open, self.arguments_close.strip(), TOOL_CALL_CLOSE)
+            for tag in (self.key_open, self.arguments_close.strip(), self.call_close_tag)
             if tag
         )
 
@@ -74,7 +76,6 @@ class ToolCallSyntax:
         argument follows it, so a value may hold the tags in any other
         order."""
         return tuple(self.value_close + tag for tag in self.argument_tags)
-
 
 # Qwen3-Coder's XML, as Qwen's templates lay a call out: a tag around the
 # function and around each parameter, on lines of their own.
@@ -101,6 +102,19 @@ GLM_ARGS = ToolCallSyntax(
     arguments_close="",
     tags_are_tokens=True,
 )
+# Muse Glimmer's ATEM XML, as Muse-Glimmer-30B's template lays a call out.
+MUSE_ATEM = ToolCallSyntax(
+    call_open_tag="<atem:function_calls>",
+    call_close_tag="</atem:function_calls>",
+    name_open='\n<atem:invoke name="',
+    name_close='">\n',
+    key_open='<atem:parameter name="',
+    key_close='">',
+    value_open="",
+    value_close="</atem:parameter>\n",
+    arguments_close="</atem:invoke>\n",
+    tags_are_tokens=False,
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -115,19 +129,25 @@ class ChatFormat:
     # text its tokenizer encodes as that token; the tokenizer's EOS is one.
     stop_tokens: tuple[tuple[str, int], ...]
     # The token of THINK_END, which closes the reasoning.
+    # The token of think_end_tag, which closes the reasoning.
     think_end_id: int
-    # The token of THINK_START where the model opens its reasoning itself, as
-    # its first token, as a template without a thinking switch leaves it to
-    # (Flint's); None where the generation prompt opens it, as Qwen's do by
-    # the request's reasoning effort.
+    # The token of think_start_tag where the model opens its reasoning itself,
+    # as its first token, as a template without a thinking switch leaves it to
+    # (Flint's); None where the generation prompt opens it, as Qwen's and Muse
+    # Glimmer's do by the request's reasoning effort.
     think_start_id: int | None
-    # The token of TOOL_CALL_OPEN.
-    call_open_id: int
+    # The token of call_open_tag, or None where call_open_tag is multi-token BPE text.
+    call_open_id: int | None
     call_syntax: ToolCallSyntax
     # The template's special token after which prompt tokenization reuses a
     # cached prompt's tokens (tokenization.PromptTokenizer).
     message_boundary: str
-
+    think_start_tag: str = THINK_START
+    think_end_tag: str = THINK_END
+    image_pad_token: str = "<|image_pad|>"
+    image_patch_size: int = 16
+    envelope_open: str | None = None
+    envelope_close: str | None = None
     @property
     def stop_ids(self):
         return tuple(token for _text, token in self.stop_tokens)
@@ -146,10 +166,9 @@ class ChatFormat:
         """Whether a call's opening also ends the reasoning where a call may
         follow. A Qwen model may call a tool in the think block its
         generation prompt opened, without closing it; a model that opens its
-        reasoning itself closes it before it calls one, so there a call's
-        opening is reasoning, as Flint's own parser reads it."""
-        return self.think_start_id is None
-
+        reasoning itself or closes it with <|eom|> before a tool sub-message
+        does not."""
+        return self.think_start_id is None and self.call_open_id is not None
 
 # The Qwen families' (Qwen3_8.hpp, Qwen3_6Moe.hpp, Qwen4Exp.hpp): a padded
 # vocabulary, <|endoftext|> and the turn end <|im_end|> as stop tokens, and a
@@ -180,4 +199,25 @@ FLINT = ChatFormat(
     call_open_id=150010,
     call_syntax=GLM_ARGS,
     message_boundary="<|assistant|>",
+)
+# Muse Glimmer's (MuseGlimmer.hpp): a padded 202,048 vocabulary, <|end_of_text|>
+# and the turn end <|eot|> as stop tokens, <|eom|> closing the to=self reasoning
+# sub-message, and ATEM XML tool calls in to=<tool> sub-messages.
+MUSE_GLIMMER = ChatFormat(
+    vocabulary=202048,
+    stop_tokens=(
+        ("<|end_of_text|>", 200001),
+        ("<|eot|>", 200008),
+    ),
+    think_end_id=200007,
+    think_start_id=None,
+    call_open_id=None,
+    call_syntax=MUSE_ATEM,
+    message_boundary="<|eot|>",
+    think_start_tag=" to=self<|message|>",
+    think_end_tag="<|eom|>",
+    image_pad_token="<|patch|>",
+    image_patch_size=14,
+    envelope_open="<|start|>assistant",
+    envelope_close="<|message|>",
 )

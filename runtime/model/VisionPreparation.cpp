@@ -16,7 +16,8 @@ uint32_t elementBytes(const SourceTensor &tensor) { return tensor.dtype == "F32"
 
 // Converts count values of tensor to BF16 bits. False when a value is not
 // exactly a BF16.
-bool convert(const SourceTensor &tensor, const uint8_t *source, uint16_t *destination, uint64_t count) {
+bool convert(const SourceTensor &tensor, const uint8_t *source, uint16_t *destination, uint64_t count,
+             bool roundFloat32 = false) {
   if (tensor.dtype == "BF16") {
     std::memcpy(destination, source, count * kBFloat16Bytes);
     return true;
@@ -30,9 +31,13 @@ bool convert(const SourceTensor &tensor, const uint8_t *source, uint16_t *destin
       std::memcpy(&half, source + i * 2, 2);
       value = static_cast<float>(half);
     }
-    const auto bits = exactBfloat16(value);
-    if (!bits) return false;
-    destination[i] = *bits;
+    if (const auto bits = exactBfloat16(value)) {
+      destination[i] = *bits;
+    } else if (roundFloat32) {
+      destination[i] = roundToBfloat16(value);
+    } else {
+      return false;
+    }
   }
   return true;
 }
@@ -50,11 +55,13 @@ struct Staging {
 // padded rows are not written.
 void addSectionTasks(uint8_t *image, const Section &s, uint32_t pixels,
                      std::vector<std::function<void(Staging &)>> &tasks) {
+  if (s.zeroFill || s.inputs.empty()) return;
   const auto frames = static_cast<uint32_t>(s.inputs.size());
   const uint32_t columns = s.columns / frames;
   uint32_t widest = 0;
   for (const auto &in : s.inputs) widest = std::max(widest, elementBytes(in.tensor));
-  const uint64_t stagedRowBytes = uint64_t(columns) * widest + (s.patch ? uint64_t(s.columns) * kBFloat16Bytes : 0);
+  const uint64_t stagedRowBytes =
+      uint64_t(columns) * widest + ((s.patch || s.transposeMergeColumns) ? uint64_t(s.columns) * kBFloat16Bytes : 0);
   const auto batchRows = static_cast<uint32_t>(std::clamp<uint64_t>(kLoadStepBytes / stagedRowBytes, 1, s.rows));
   for (uint32_t row = 0; row < s.rows; row += batchRows) {
     const uint32_t count = std::min(batchRows, s.rows - row);
@@ -66,11 +73,21 @@ void addSectionTasks(uint8_t *image, const Section &s, uint32_t pixels,
         if (staging.source.size() < count * bytes) staging.source.resize(count * bytes);
         in.tensor.read(row * bytes, std::span(staging.source).first(count * bytes));
         for (uint32_t r = 0; r < count; ++r)
-          if (!convert(in.tensor, staging.source.data() + r * bytes, to + uint64_t(r) * stride, columns))
+          if (!convert(in.tensor, staging.source.data() + r * bytes, to + uint64_t(r) * stride, columns,
+                       s.roundFloat32))
             throw WeightStoreError("vision tensor " + in.name + " in " + in.tensor.file->path().string() +
                                    " is not exactly representable in BF16");
       };
-      if (!s.patch) {
+      if (s.transposeMergeColumns) {
+        if (staging.values.size() < uint64_t(count) * s.columns) staging.values.resize(uint64_t(count) * s.columns);
+        uint16_t *values = staging.values.data();
+        convertRows(s.inputs.front(), values, s.columns);
+        const uint32_t hidden = s.columns / 4;
+        for (uint32_t r = 0; r < count; ++r)
+          for (uint32_t m = 0; m < 4; ++m)
+            for (uint32_t c = 0; c < hidden; ++c)
+              output[uint64_t(r) * s.storedColumns + m * hidden + c] = values[uint64_t(r) * s.columns + c * 4 + m];
+      } else if (!s.patch) {
         convertRows(s.inputs.front(), output, s.storedColumns);
       } else {
         if (staging.values.size() < uint64_t(count) * s.columns) staging.values.resize(uint64_t(count) * s.columns);
@@ -98,7 +115,7 @@ void writeVision(std::span<uint8_t> destination, const Plan &plan) {
   const auto header = weightFileHeader(kVisionMagic, plan.depth, 0);
   std::vector<std::pair<uint64_t, uint64_t>> extents{{0, header.size()}};
   for (const auto &s : plan.sections)
-    extents.emplace_back(s.offset, uint64_t(s.rows) * s.storedColumns * kBFloat16Bytes);
+    if (!s.zeroFill) extents.emplace_back(s.offset, uint64_t(s.rows) * s.storedColumns * kBFloat16Bytes);
   zeroUnwritten(destination, std::move(extents));
   std::memcpy(destination.data(), header.data(), header.size());
   std::vector<std::function<void(Staging &)>> tasks;

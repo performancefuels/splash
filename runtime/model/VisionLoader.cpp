@@ -19,6 +19,51 @@ using vision::Section;
 Plan plan(const ops::VisionLayout &l) {
   Plan result{l.depth, l.patchSize, 0, {}};
   auto &sections = result.sections;
+  if (l.museTower) {
+    uint64_t at = kWeightFileAlignment;
+    const auto addMuse = [&](std::string gguf, uint32_t rows, uint32_t columns = 1, uint32_t storedColumns = 0,
+                             bool zeroFill = false, bool transposeMerge = false, bool alignEnd = true) {
+      const uint32_t sc = storedColumns ? storedColumns : columns;
+      Section s{"", std::move(gguf), rows, columns, rows, sc, false, true, zeroFill, transposeMerge, at, {}};
+      const uint64_t bytes = uint64_t(rows) * sc * kBFloat16Bytes;
+      at = alignEnd ? alignWeightOffset(at + bytes) : at + bytes;
+      sections.push_back(std::move(s));
+    };
+    addMuse("v.patch_embd.weight", l.hiddenSize, l.patchDimension, l.paddedPatchDimension);
+    addMuse("v.patch_embd.bias", l.hiddenSize, 1, 1, true);
+    addMuse("v.position_embd.weight", l.positionGridSide * l.positionGridSide, l.hiddenSize);
+    addMuse("v.pre_ln.weight", l.hiddenSize);
+    addMuse("v.pre_ln.bias", l.hiddenSize);
+    for (uint32_t i = 0; i < l.depth; ++i) {
+      const std::string p = "v.blk." + std::to_string(i) + ".";
+      addMuse(p + "ln1.weight", l.hiddenSize);
+      addMuse(p + "ln1.bias", l.hiddenSize);
+      addMuse(p + "attn_q.weight", l.hiddenSize, l.hiddenSize, 0, false, false, false);
+      addMuse(p + "attn_k.weight", l.hiddenSize, l.hiddenSize, 0, false, false, false);
+      addMuse(p + "attn_v.weight", l.hiddenSize, l.hiddenSize, 0, false, false, true);
+      addMuse(p + "attn_q.bias", l.hiddenSize, 1, 0, false, false, false);
+      addMuse(p + "attn_k.bias", l.hiddenSize, 1, 0, false, false, false);
+      addMuse(p + "attn_v.bias", l.hiddenSize, 1, 0, false, false, true);
+      addMuse(p + "attn_out.weight", l.hiddenSize, l.hiddenSize);
+      addMuse(p + "attn_out.bias", l.hiddenSize);
+      addMuse(p + "ln2.weight", l.hiddenSize);
+      addMuse(p + "ln2.bias", l.hiddenSize);
+      addMuse(p + "ffn_up.weight", l.intermediateSize, l.hiddenSize, l.paddedIntermediateSize);
+      addMuse(p + "ffn_up.bias", l.intermediateSize, 1);
+      addMuse(p + "ffn_down.weight", l.hiddenSize, l.intermediateSize, l.paddedIntermediateSize);
+      addMuse(p + "ffn_down.bias", l.hiddenSize, 1);
+    }
+    addMuse("v.post_ln.weight", l.hiddenSize);
+    addMuse("v.post_ln.bias", l.hiddenSize);
+    addMuse("mm.0.weight", l.projectorHiddenSize, l.mergedHiddenSize, 0, false, true);
+    addMuse("mm.0.bias", l.projectorHiddenSize, 1, 1, true);
+    addMuse("mm.1.weight", l.projectorHiddenSize, l.projectorHiddenSize);
+    addMuse("mm.1.bias", l.projectorHiddenSize, 1, 1, true);
+    addMuse("mm.2.weight", l.outputHiddenSize, l.projectorHiddenSize);
+    addMuse("mm.2.bias", l.outputHiddenSize, 1, 1, true);
+    result.bytes = at;
+    return result;
+  }
   const auto add = [&](std::string mlx, std::string gguf, uint32_t rows, uint32_t columns = 1,
                        uint32_t paddedRows = 0, uint32_t paddedColumns = 0) {
     sections.push_back({"vision_tower." + mlx, std::move(gguf), rows, columns, paddedRows ? paddedRows : rows,
@@ -98,7 +143,8 @@ void bindCheckpoint(const SafetensorsCheckpoint &checkpoint, const ops::VisionLa
 // deepstack block.
 void requireMmprojMetadata(const GgufFile &gguf, const ops::VisionLayout &layout) {
   const GgufMetadata &metadata = gguf.metadata();
-  if (metadata.architecture() != "clip" || metadata.stringValue("clip.projector_type") != "qwen3vl_merger")
+  const std::string_view expectedProjector = layout.museTower ? "muse-glimmer" : "qwen3vl_merger";
+  if (metadata.architecture() != "clip" || metadata.stringValue("clip.projector_type") != expectedProjector)
     throw WeightStoreError("unsupported vision GGUF architecture");
   for (const auto &[key, expected] : std::initializer_list<std::pair<const char *, uint64_t>>{
            {"clip.vision.projection_dim", layout.outputHiddenSize},
@@ -107,11 +153,13 @@ void requireMmprojMetadata(const GgufFile &gguf, const ops::VisionLayout &layout
            {"clip.vision.feed_forward_length", layout.intermediateSize},
            {"clip.vision.block_count", layout.depth},
            {"clip.vision.attention.head_count", layout.heads},
-           {"clip.vision.spatial_merge_size", layout.spatialMerge},
-           {"clip.use_gelu", 1}})
+           {"clip.vision.spatial_merge_size", layout.spatialMerge}})
     if (metadata.unsignedValue(key) != expected) throw WeightStoreError(std::string("vision metadata mismatch: ") + key);
+  if (!layout.museTower && metadata.unsignedValue("clip.use_gelu") != 1)
+    throw WeightStoreError("vision metadata mismatch: clip.use_gelu");
   const auto epsilon = metadata.floatValue("clip.vision.attention.layer_norm_epsilon");
-  if (!epsilon || !std::isfinite(*epsilon) || std::abs(*epsilon - SPLASH_VISION_NORM_EPSILON) > 1e-12)
+  const double expectedEps = layout.museTower ? 1e-5 : SPLASH_VISION_NORM_EPSILON;
+  if (!epsilon || !std::isfinite(*epsilon) || std::abs(*epsilon - expectedEps) > 1e-10)
     throw WeightStoreError("vision LayerNorm epsilon mismatch");
   for (const char *key : {"clip.vision.image_mean", "clip.vision.image_std"}) {
     const auto values = gguf.numericArray(key);
@@ -119,29 +167,30 @@ void requireMmprojMetadata(const GgufFile &gguf, const ops::VisionLayout &layout
         !std::all_of(values->begin(), values->end(), [](double x) { return x == 0.5; }))
       throw WeightStoreError("vision image normalization mismatch");
   }
-  // Each block must be declared: a deepstack block feeds the language model
-  // through tensors this tower does not have.
-  const auto deepstack = gguf.numericArray("clip.vision.is_deepstack_layers");
-  if (!deepstack || deepstack->size() != layout.depth)
-    throw WeightStoreError("vision metadata must list clip.vision.is_deepstack_layers per block");
-  if (std::any_of(deepstack->begin(), deepstack->end(), [](double x) { return x != 0; }))
-    throw WeightStoreError("vision deepstack layers are unsupported");
+  if (!layout.museTower) {
+    const auto deepstack = gguf.numericArray("clip.vision.is_deepstack_layers");
+    if (!deepstack || deepstack->size() != layout.depth)
+      throw WeightStoreError("vision metadata must list clip.vision.is_deepstack_layers per block");
+    if (std::any_of(deepstack->begin(), deepstack->end(), [](double x) { return x != 0; }))
+      throw WeightStoreError("vision deepstack layers are unsupported");
+  }
 }
 
-// GGUF: a qwen3vl_merger mmproj describing this tower, all of whose tensors
-// preparation uses. The patch embedding is one [channel, patch-row,
-// patch-col] weight per temporal frame (v.patch_embd.weight and .weight.1).
+// GGUF: a qwen3vl_merger or muse-glimmer mmproj describing this tower, all of
+// whose tensors preparation uses.
 void bindMmproj(const GgufFile &gguf, const ops::VisionLayout &layout, Plan &plan) {
   requireMmprojMetadata(gguf, layout);
   const uint64_t p = layout.patchSize;
   std::set<std::string, std::less<>> used;
   for (auto &s : plan.sections) {
+    if (s.zeroFill) continue;
     for (uint32_t frame = 0; frame < (s.patch ? 2u : 1u); ++frame) {
       std::string name = s.gguf + (frame ? ".1" : "");
       const GgufTensor &t = gguf.require(name);
-      const std::vector<uint64_t> shape = s.patch          ? std::vector<uint64_t>{p, p, 3, s.rows}
-                                          : s.columns == 1 ? std::vector<uint64_t>{s.rows}
-                                                           : std::vector<uint64_t>{s.columns, s.rows};
+      const bool musePatch = layout.museTower && name == "v.patch_embd.weight";
+      const std::vector<uint64_t> shape = (s.patch || musePatch) ? std::vector<uint64_t>{p, p, 3, s.rows}
+                                          : s.columns == 1       ? std::vector<uint64_t>{s.rows}
+                                                                 : std::vector<uint64_t>{s.columns, s.rows};
       if (t.dims != shape) throw WeightStoreError("vision tensor shape mismatch: " + name);
       const std::string dtype = ggmlTypeName(t.type);
       used.insert(name);
@@ -205,13 +254,15 @@ uint64_t visionImageBytes(const ops::VisionLayout &layout) { return plan(layout)
 // The writer relies on the patch embedding's width, two frames of RGB
 // patches, and on padding that only adds rows or columns.
 void requireVisionLayout(const ops::VisionLayout &layout) {
-  if (!layout.depth || !layout.hiddenSize || !layout.patchDimension || !layout.intermediateSize ||
-      !layout.paddedIntermediateSize || !layout.mergedHiddenSize || !layout.outputHiddenSize || !layout.heads ||
-      !layout.headDimension || !layout.positionGridSide || !layout.patchSize || !layout.spatialMerge ||
+  if (!layout.depth || !layout.hiddenSize || !layout.patchDimension || !layout.paddedPatchDimension ||
+      !layout.intermediateSize || !layout.paddedIntermediateSize || !layout.mergedHiddenSize ||
+      !layout.projectorHiddenSize || !layout.outputHiddenSize || !layout.heads || !layout.headDimension ||
+      !layout.positionGridSide || !layout.patchSize || !layout.spatialMerge || !layout.temporalPatchSize ||
       layout.heads * layout.headDimension != layout.hiddenSize ||
       layout.paddedIntermediateSize < layout.intermediateSize ||
+      layout.paddedPatchDimension < layout.patchDimension ||
       layout.mergedHiddenSize != layout.hiddenSize * layout.spatialMerge * layout.spatialMerge ||
-      layout.patchDimension != 3 * 2 * layout.patchSize * layout.patchSize)
+      layout.patchDimension != 3 * layout.temporalPatchSize * layout.patchSize * layout.patchSize)
     throw WeightStoreError("Qwen vision layout is inconsistent");
 }
 

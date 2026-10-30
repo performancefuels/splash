@@ -89,6 +89,9 @@ struct DFlashDraftLayout final {
   // first targetLayerCount of targetLayers, targetHiddenSize() values a row.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> targetLayers{};
   uint32_t targetLayerCount = 0;
+  float rmsEpsilon = SPLASH_RMS_EPSILON;
+  float logitScale = 0.0F;
+  float finalLogitSoftcap = 0.0F;
 
   [[nodiscard]] constexpr DraftStateLayout stateLayout() const noexcept {
     return {layers, kvHeads, attentionHeadDimension, hiddenSize};

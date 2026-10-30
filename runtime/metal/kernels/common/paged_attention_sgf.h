@@ -138,7 +138,7 @@ template <> struct ValueRun<bfloat> {
 // tokens, and rows past active_rows repeat the last active row's mask. A
 // kernel compiled with a Window attends, for a row at position p, only the
 // keys p - Window to p (Window + 1 with its own; a sliding-window layer's).
-template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim, uint Window, typename CacheElement>
+template <uint KVHeads, uint QueryHeadsPerKVHead, uint Rows, uint HeadDim, uint Window, typename CacheElement>
 __attribute__((always_inline)) inline void tile(
     device const bfloat *tile_queries, device const SplashKvPage *page_table,
     SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
@@ -146,7 +146,6 @@ __attribute__((always_inline)) inline void tile(
     uint sg, uint lane, threadgroup uint *query_stage) {
   constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
   constexpr uint G = QueryHeadsPerKVHead;
-  constexpr uint Rows = 8;
   constexpr uint M = Rows * G;
   constexpr uint N = SplashKvPageTokens;
   constexpr uint D = HeadDim;
@@ -154,9 +153,7 @@ __attribute__((always_inline)) inline void tile(
   constexpr uint DimTiles = D / 8;
   static_assert(N == 32 && (D == 128 || D == 256),
                 "fragment maps assume Page32 and D = 128 or 256");
-  static_assert(SPLASH_TARGET_VERIFY_ROWS == Rows &&
-                    SPLASH_PREFILL_ATTENTION_TILE_ROWS == Rows,
-                "one simdgroup per G fused rows of an eight-row tile");
+  static_assert(M % 8 == 0, "whole simdgroups of eight fused rows");
   const uint visible = committed_tokens + active_rows;
   const uint pages = splash_attention_pages(visible);
   const uint first_page = Window ? splash_attention_first_page<Window>(committed_tokens) : 0;

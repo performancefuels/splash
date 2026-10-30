@@ -122,11 +122,12 @@ def validate_tokenizer(tokenizer, chat_format):
         )
     expected = {
         **dict(chat_format.stop_tokens),
-        THINK_END: chat_format.think_end_id,
-        TOOL_CALL_OPEN: chat_format.call_open_id,
+        chat_format.think_end_tag: chat_format.think_end_id,
     }
+    if chat_format.call_open_id is not None:
+        expected[chat_format.call_syntax.call_open_tag] = chat_format.call_open_id
     if chat_format.think_start_id is not None:
-        expected[THINK_START] = chat_format.think_start_id
+        expected[chat_format.think_start_tag] = chat_format.think_start_id
     for token, token_id in expected.items():
         if vocabulary.get(token) != token_id or tokenizer.encode(
             token, add_special_tokens=False

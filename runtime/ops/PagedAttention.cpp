@@ -62,6 +62,7 @@ constexpr std::array kCompiledAttention{
     CompiledAttention{32, 2, 256, false, true, false, 32, false, 0, "_kv2_g16", "_kv2_g8"},
     CompiledAttention{24, 2, 256, true, true, false, 32, false, 0, "_kv2_g12", "_kv2_vt"},
     CompiledAttention{32, 4, 128, false, false, true, 64, true, 512, "_kv4_g8_d128", "_kv4_d128"},
+    CompiledAttention{32, 2, 128, false, true, false, 64, true, 2048, "_kv2_g16_d128", "_kv2_d128"},
 };
 
 // Whether a compiled geometry's pages are a layout's: its KV heads, head
@@ -243,8 +244,9 @@ uint32_t prefillSplits(uint32_t tiles, uint32_t windowTokens) {
 metal::DispatchSize splitThreads(AttentionTile tile, uint32_t queryHeads, kv::Layout layout) {
   if (tile != AttentionTile::Mpp && tile != AttentionTile::Register)
     throw std::invalid_argument("invalid attention tile");
-  return {tile == AttentionTile::Register ? uint64_t{32} * (queryHeads / layout.kvHeads)
-                                          : metal::CommandGraph::kDefaultThreads,
+  return {tile == AttentionTile::Register
+              ? uint64_t{32} * (queryHeads / layout.kvHeads) / tileParts(queryHeads, layout)
+              : metal::CommandGraph::kDefaultThreads,
           1, 1};
 }
 
@@ -268,7 +270,7 @@ PrefillAttentionPlan PagedAttention::prefillPlan(
                          (registerTile ? "_sgf" : ""),
                      splitSuffix(kernel, variant)),
           reduceKernel("prefill", kernel, variant),
-          {layout.kvHeads * (registerTile ? 1 : tileParts(queryHeads, layout)), tiles, splits},
+          {layout.kvHeads * tileParts(queryHeads, layout), tiles, splits},
           splitThreads(tile, queryHeads, layout),
           {layout.kvHeads, fusedRows, tiles}, layout.valuesTokenMajor, kernel.sinks,
           layout, queryHeads};
@@ -306,7 +308,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
           // (x the KV head, y the split) worse, running it up to 1.7x slower
           // on most grids of more than 32 splits.
           layout.valuesTokenMajor ? metal::DispatchSize{layout.kvHeads * splits, 1, lanes}
-                                  : metal::DispatchSize{layout.kvHeads * (registerTile ? 1 : tileParts(queryHeads, layout)),
+                                  : metal::DispatchSize{layout.kvHeads * tileParts(queryHeads, layout),
                                                         splits, lanes},
           splitThreads(tile, queryHeads, layout),
           {layout.kvHeads,

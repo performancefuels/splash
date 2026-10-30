@@ -227,6 +227,117 @@ inline void attention(device const bfloat *queries, device const bfloat *keys,
   }
 }
 
+
+constexpr constant uint kMuseHeadDim = 96, kMuseKeyStride = 100, kMuseValueStride = 100;
+
+inline uint2 muse_patch_position(uint token, uint grid_width) {
+  uint blocks_w = grid_width / 2u;
+  uint block = token / 4u;
+  uint inner = token % 4u;
+  return uint2((block / blocks_w) * 2u + inner / 2u,
+               (block % blocks_w) * 2u + inner % 2u);
+}
+
+inline void attention_d96(device const bfloat *queries, device const bfloat *keys,
+                          device const bfloat *values, device bfloat *output,
+                          constant MuseVisionAttentionParams &p, uint2 tg, uint sg, uint lane,
+                          threadgroup float *stage_k, threadgroup float *stage_v) {
+  const Lane l = lane_map(lane);
+  const uint fm = l.fm, fn = l.fn;
+  const uint thread_index = sg * 32 + lane;
+  const uint head = tg.y, row = tg.x * kRows + sg * 8 + fn;
+  const ulong plane = ulong(head) * p.padded_tokens;
+  device const bfloat *q = queries + (plane + row) * kMuseHeadDim + fm;
+  device const bfloat *k = keys + plane * kMuseHeadDim;
+  device const bfloat *v = values + plane * kMuseHeadDim;
+
+  float2 query[kMuseHeadDim / 8];
+#pragma unroll
+  for (uint t = 0; t < kMuseHeadDim / 8; ++t) query[t] = float2(q[8 * t], q[kMuseHeadDim + 8 * t]);
+  float2 out[kMuseHeadDim / 8];
+#pragma unroll
+  for (uint d = 0; d < kMuseHeadDim / 8; ++d) out[d] = float2(0.0f);
+  float2 row_max(-INFINITY), row_sum(0.0f);
+
+  const uint context = p.tokens;
+  const uint2 q0_win = p.windowed ? muse_patch_position(min(row, context - 1), p.grid_width) / 32u : uint2(0u);
+  const uint2 q1_win = p.windowed ? muse_patch_position(min(row + 1, context - 1), p.grid_width) / 32u : uint2(0u);
+  for (uint base = 0; base < context; base += kKeys) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint u = thread_index; u < kKeys * (2 * kMuseHeadDim) / 8; u += kThreads) {
+      const bool key = u < kKeys * kMuseHeadDim / 8;
+      const uint e = 8 * (key ? u : u - kKeys * kMuseHeadDim / 8);
+      const uint4 w = *reinterpret_cast<device const uint4 *>(
+          (key ? k + ulong(base) * kMuseHeadDim : v + ulong(base) * kMuseHeadDim) + e);
+      threadgroup float *dst = key ? stage_k + (e / kMuseHeadDim) * kMuseKeyStride + e % kMuseHeadDim
+                                   : stage_v + (e / kMuseHeadDim) * kMuseValueStride + e % kMuseHeadDim;
+      *reinterpret_cast<threadgroup float4 *>(dst) =
+          float4(widen(w.xy, 0), widen(w.xy, 1), widen(w.xy, 2), widen(w.xy, 3));
+      *reinterpret_cast<threadgroup float4 *>(dst + 4) =
+          float4(widen(w.zw, 0), widen(w.zw, 1), widen(w.zw, 2), widen(w.zw, 3));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float2 score[kKeys / 8];
+#pragma unroll
+    for (uint s = 0; s < kKeys / 8; ++s) {
+      score[s] = float2(0.0f);
+      threadgroup const float *kr = stage_k + (8 * s + fm) * kMuseKeyStride + fn;
+#pragma unroll
+      for (uint t = 0; t < kMuseHeadDim / 8; ++t)
+        mma(score[s], *reinterpret_cast<threadgroup const float2 *>(kr + 8 * t), query[t]);
+    }
+
+    float2 local_max(-INFINITY);
+#pragma unroll
+    for (uint s = 0; s < kKeys / 8; ++s) {
+      const uint key_token = base + 8 * s + fm;
+      const bool live = key_token < context;
+      const uint2 k_win = (p.windowed && live) ? muse_patch_position(key_token, p.grid_width) / 32u : uint2(0u);
+      const bool live0 = live && (!p.windowed || all(k_win == q0_win));
+      const bool live1 = live && (!p.windowed || all(k_win == q1_win));
+      score[s] = float2(live0 ? score[s].x * p.scale : -INFINITY,
+                        live1 ? score[s].y * p.scale : -INFINITY);
+      local_max = max(local_max, score[s]);
+    }
+    local_max = max(local_max, simd_shuffle_xor(local_max, 2));
+    local_max = max(local_max, simd_shuffle_xor(local_max, 4));
+    local_max = max(local_max, simd_shuffle_xor(local_max, 16));
+    const float2 next_max = max(row_max, local_max);
+    float2 local_sum(0.0f);
+#pragma unroll
+    for (uint s = 0; s < kKeys / 8; ++s) {
+      const float2 e = float2(next_max.x == -INFINITY ? 0.0f : fast::exp(score[s].x - next_max.x),
+                              next_max.y == -INFINITY ? 0.0f : fast::exp(score[s].y - next_max.y));
+      local_sum += e;
+      score[s] = float2(float(bfloat(e.x)), float(bfloat(e.y)));
+    }
+    local_sum += simd_shuffle_xor(local_sum, 2);
+    local_sum += simd_shuffle_xor(local_sum, 4);
+    local_sum += simd_shuffle_xor(local_sum, 16);
+    const float2 scale(row_max.x == -INFINITY ? 0.0f : fast::exp(row_max.x - next_max.x),
+                       row_max.y == -INFINITY ? 0.0f : fast::exp(row_max.y - next_max.y));
+    row_sum = row_sum * scale + local_sum;
+    row_max = next_max;
+
+#pragma unroll
+    for (uint d = 0; d < kMuseHeadDim / 8; ++d) {
+      float2 partial(0.0f);
+      threadgroup const float *vr = stage_v + fn * kMuseValueStride + 8 * d + fm;
+#pragma unroll
+      for (uint s = 0; s < kKeys / 8; ++s)
+        mma(partial, float2(vr[8 * s * kMuseValueStride], vr[(8 * s + 1) * kMuseValueStride]), score[s]);
+      out[d] = out[d] * scale + partial;
+    }
+  }
+
+  device bfloat *o = output + (plane + row) * kMuseHeadDim + fm;
+#pragma unroll
+  for (uint d = 0; d < kMuseHeadDim / 8; ++d) {
+    o[8 * d] = bfloat(out[d].x / row_sum.x);
+    o[kMuseHeadDim + 8 * d] = bfloat(out[d].y / row_sum.y);
+  }
+}
 } // namespace vision_mma
 
 #define VISION_GEMM_MMA_KERNEL(name, tile_m, tile_n, activation, add_residual, output_type) \
@@ -246,6 +357,7 @@ VISION_GEMM_MMA_KERNEL(vision_gemm_mma_m64n128, 64, 128, None, false, bfloat)
 // The fp32 residual stream of vision_gemm_m64n128_residual.
 VISION_GEMM_MMA_KERNEL(vision_gemm_mma_m64n128_residual, 64, 128, None, true, float)
 VISION_GEMM_MMA_KERNEL(vision_gemm_mma_m64n128_gelu_tanh, 64, 128, GeluTanh, false, bfloat)
+VISION_GEMM_MMA_KERNEL(vision_gemm_mma_m64n128_gelu_erf, 64, 128, GeluErf, false, bfloat)
 VISION_GEMM_MMA_KERNEL(vision_gemm_mma_m32n256, 32, 256, None, false, bfloat)
 VISION_GEMM_MMA_KERNEL(vision_gemm_mma_m32n256_gelu_erf, 32, 256, GeluErf, false, bfloat)
 #undef VISION_GEMM_MMA_KERNEL
@@ -261,4 +373,17 @@ kernel void vision_attention_mma(device bfloat *queries [[buffer(0)]],
   threadgroup float stage_k[vision_mma::kKeys * vision_mma::kKeyStride];
   threadgroup float stage_v[vision_mma::kKeys * vision_mma::kValueStride];
   vision_mma::attention(queries, keys, values, output, params, tg, sg, lane, stage_k, stage_v);
+}
+
+kernel void vision_attention_mma_d96(device bfloat *queries [[buffer(0)]],
+                                     device bfloat *keys [[buffer(1)]],
+                                     device bfloat *values [[buffer(2)]],
+                                     device bfloat *output [[buffer(3)]],
+                                     constant MuseVisionAttentionParams &params [[buffer(4)]],
+                                     uint2 tg [[threadgroup_position_in_grid]],
+                                     uint sg [[simdgroup_index_in_threadgroup]],
+                                     uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float stage_k[vision_mma::kKeys * vision_mma::kMuseKeyStride];
+  threadgroup float stage_v[vision_mma::kKeys * vision_mma::kMuseValueStride];
+  vision_mma::attention_d96(queries, keys, values, output, params, tg, sg, lane, stage_k, stage_v);
 }

@@ -41,6 +41,8 @@ model::DFlashDraftLayout draftOf(std::string_view family) {
     return test::flashNextDraft();
   if (family == model::FlintLayout{}.family)
     return test::flintDraft();
+  if (family == model::MuseGlimmerLayout{}.family)
+    return test::museGlimmerDraft();
   throw std::logic_error(std::string(family) + " has no draft to take its values with");
 }
 

@@ -247,7 +247,10 @@ void Linear::addPrefillSwiGlu(metal::CommandGraph &graph, const SwiGluProjection
                               uint32_t rows) const {
   addPrefill(graph, b.normalized, *ffn.gate, b.gateScratch, rows, b.scratch);
   addPrefillUpWithGate(graph, b.normalized, *ffn.up, b.gateScratch, b.intermediate, rows, b.scratch);
-  addPrefillResidual(graph, b.intermediate, *ffn.down, residual, output, rows, b.scratch);
+  if (residual)
+    addPrefillResidual(graph, b.intermediate, *ffn.down, std::move(residual), std::move(output), rows, b.scratch);
+  else
+    addPrefill(graph, b.intermediate, *ffn.down, std::move(output), rows, b.scratch);
 }
 void Linear::addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &up,
                                   metal::MetalBuffer gateScratch, metal::MetalBuffer output, uint32_t rows,

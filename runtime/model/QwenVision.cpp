@@ -38,7 +38,7 @@ QwenVisionWeights readVision(metal::MetalBackend &backend, WeightImages &images,
 
   WeightFile file = images.load(std::move(image));
   result.tensors.patchEmbedding =
-      readAffine(file, layout.hiddenSize, layout.patchDimension, "patch-embed");
+      readAffine(file, layout.hiddenSize, layout.paddedPatchDimension, "patch-embed");
   result.tensors.positionTable = file.section(
       checkedMultiply<WeightStoreError>(
           checkedMultiply<WeightStoreError>(
@@ -48,6 +48,8 @@ QwenVisionWeights readVision(metal::MetalBackend &backend, WeightImages &images,
               layout.hiddenSize, "vision position elements"),
           kBFloat16Bytes, "vision position bytes"),
       "position-table");
+  if (layout.museTower)
+    result.tensors.preNorm = readNorm(file, layout.hiddenSize, "pre-norm");
   for (uint32_t blockIndex = 0; blockIndex < layout.depth; ++blockIndex) {
     ops::VisionBlock block;
     block.norm1 = readNorm(file, layout.hiddenSize, "norm1");
@@ -63,9 +65,12 @@ QwenVisionWeights readVision(metal::MetalBackend &backend, WeightImages &images,
   }
   result.tensors.mergerNorm = readNorm(file, layout.hiddenSize, "merger-norm");
   result.tensors.mergerUpProjection = readAffine(
-      file, layout.mergedHiddenSize, layout.mergedHiddenSize, "merger-fc1");
+      file, layout.projectorHiddenSize, layout.mergedHiddenSize, "merger-fc1");
+  if (layout.museTower)
+    result.tensors.mergerMidProjection = readAffine(
+        file, layout.projectorHiddenSize, layout.projectorHiddenSize, "merger-fc2");
   result.tensors.mergerDownProjection = readAffine(
-      file, layout.outputHiddenSize, layout.mergedHiddenSize, "merger-fc2");
+      file, layout.outputHiddenSize, layout.projectorHiddenSize, "merger-fc3");
   file.finish();
   result.files.push_back(file.record());
 

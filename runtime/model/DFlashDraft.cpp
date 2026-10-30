@@ -166,7 +166,7 @@ void DFlashDraft::addContextPrefill(
   operators_.linear().addPrefill(graph, buffers.capturedTargetHidden, weights_.contextProjection,
                                  buffers.projected, rows, buffers.linearScratch);
   ops::Normalization::addRms(graph, buffers.projected, weights_.hiddenNorm, buffers.hidden, layout.hiddenSize,
-                             rows);
+                             rows, {}, ops::LinearInput::Plain, layout.rmsEpsilon);
   const uint64_t rowBytes = uint64_t{layout.hiddenSize} * sizeof(uint16_t);
   const auto store = [&](uint32_t compactRow, uint32_t count, uint32_t startPosition,
                          const metal::MetalBuffer &window) {
@@ -268,7 +268,7 @@ void DFlashDraft::addDecode(
     const ops::LinearPlan attentionDynamicPlan = linear.decodePlan(weights.attentionDynamic, lanes);
     const ops::PreparedInput attentionNormalized = ops::Normalization::addRms(
         graph, buffers.hidden[current], weights.inputNorm, buffers.normalized,
-        layout.hiddenSize, rows, scratch, attentionDynamicPlan.input());
+        layout.hiddenSize, rows, scratch, attentionDynamicPlan.input(), layout.rmsEpsilon);
     linear.add(graph,
                {.input = buffers.normalized, .output = buffers.dynamic, .scratch = scratch,
                 .prepared = attentionNormalized},
@@ -304,7 +304,7 @@ void DFlashDraft::addDecode(
     const ops::LinearPlan mlpDynamicPlan = linear.decodePlan(weights.mlpDynamic, lanes);
     const ops::PreparedInput mlpNormalized = ops::Normalization::addRms(
         graph, buffers.residual, weights.postAttentionNorm, buffers.normalized,
-        layout.hiddenSize, rows, scratch, mlpDynamicPlan.input());
+        layout.hiddenSize, rows, scratch, mlpDynamicPlan.input(), layout.rmsEpsilon);
     linear.add(graph,
                {.input = buffers.normalized, .output = buffers.dynamic, .scratch = scratch,
                 .prepared = mlpNormalized},
@@ -334,10 +334,12 @@ void DFlashDraft::addDecode(
   const ops::LinearPlan headPlan = linear.decodePlan(vocabularyProjection, lanes);
   const ops::PreparedInput finalHidden = ops::Normalization::addRms(
       graph, buffers.hidden[weights_.layout.layers & 1], weights_.finalNorm,
-      buffers.finalHidden, layout.hiddenSize, rows, scratch, headPlan.input());
+      buffers.finalHidden, layout.hiddenSize, rows, scratch, headPlan.input(), layout.rmsEpsilon);
   const ops::PreparedInput afterHead = linear.add(
       graph, {.input = buffers.finalHidden, .output = buffers.logits, .scratch = scratch, .prepared = finalHidden},
       vocabularyProjection, headPlan);
+  ops::Normalization::addLogitSoftcap(graph, buffers.logits, rows * layout.vocabularySize,
+                                      layout.logitScale, layout.finalLogitSoftcap);
   linear.add(graph,
              {.input = buffers.finalHidden, .output = buffers.selectorHidden, .scratch = scratch,
               .prepared = afterHead},
