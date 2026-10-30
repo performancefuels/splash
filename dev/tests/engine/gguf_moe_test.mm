@@ -20,8 +20,8 @@
 //   register tile, whatever GPU runs the test; decode steps and prefill
 //   chunks) for every format the tile takes (the register tile all but F16,
 //   in rows it takes: quant_register_tensor), gate, up and down in three of
-//   those formats and the shared expert in three more, and on the staged
-//   tiles, which run gate and up in one pass, also with up in the gate's
+//   those formats and the shared expert in three more, and on the staged/MMA
+//   tiles, also with up in the gate's
 //   formats; routes and weights against the fp64 router, each pass inside the
 //   fp64 interval its numerics allow, the block's output, a row's output
 //   bitwise equal at every lane count and chunk of one tile where its routes
@@ -161,8 +161,8 @@ bool inside(float got, double exact, double bound) {
   return got >= bf16(exact - bound) && got <= bf16(exact + bound);
 }
 
-// Apple7/8 run the staged plans on their MMA kernels (MoeGgufTile::Mma), in two gate/up passes, and neither the
-// Apple9 register tile nor the neural accelerator tiles, whose MPP matmuls run far below their MMA rate.
+// Apple7/8 run the staged plans on their MMA kernels (MoeGgufTile::Mma), not the Apple9 register or neural
+// accelerator tiles, whose MPP matmuls run far below their MMA rate.
 bool mmaTiles(const MetalBackend &backend) { return backend.capabilities().appleGpuFamily < 9; }
 std::vector<MoeGgufTile> moeTiles(const MetalBackend &backend) {
   return mmaTiles(backend) ? std::vector<MoeGgufTile>{MoeGgufTile::Mma}
@@ -639,13 +639,6 @@ struct Stats {
   double gateUpWorst = 0, downWorst = 0;
 };
 
-// A pipeline's name without the slices suffix of the test's routing
-// (ops::CompiledMoeRouting).
-std::string_view withoutSlices(std::string_view name) {
-  const std::string_view suffix = kShape.compiledRouting()->slicesSuffix;
-  return name.ends_with(suffix) ? name.substr(0, name.size() - suffix.size()) : name;
-}
-
 // The dispatches of `graph` on the grids of their bounds, every tile a step
 // could fill, with a gate/up pass split into the gate and up passes
 // (moe_expert_gguf_m<rows>_a and _g), the gate parked in expertOutput; the
@@ -837,10 +830,7 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
   const uint32_t tiles = *static_cast<const uint32_t *>(b.moe.scratch.tileCount.contents());
   require(tiles <= plan.maximumTiles(), label + ": tile count exceeds its bound");
   checkGrouping(b.moe.scratch, plan, label);
-  // Each expert pass runs the live tiles of its column tiles; gate and up run
-  // in one pass (_gate_up, _gate_up_mixed where their formats differ) or as
-  // the gate and up passes (_a, then _g).
-  uint32_t gateUpPasses = 0, upPasses = 0;
+  // Each expert pass runs only the live tiles within its column bounds.
   for (const ComputeDispatch &dispatch : graph.dispatches()) {
     const uint32_t *grid = nullptr;
     if (const MetalBuffer &buffer = dispatch.indirectThreadgroups.buffer)
@@ -849,14 +839,7 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
                 (!grid || (grid[0] == dispatch.threadgroups.x && grid[1] == tiles && grid[2] == 1 &&
                            dispatch.threadgroups.y == plan.maximumTiles())),
             label + ": " + dispatch.pipelineName + " runs another grid than its live tiles");
-    const std::string_view pass = withoutSlices(dispatch.pipelineName);
-    gateUpPasses += pass.ends_with("_gate_up") || pass.ends_with("_gate_up_mixed");
-    upPasses += pass.ends_with("_g");
   }
-  // Only the staged tile fuses gate and up; Apple7/8's MMA tile runs two passes like the register tile.
-  const bool oneGateUp = plan.configuration().ggufTile == MoeGgufTile::Staged;
-  require(gateUpPasses == oneGateUp && upPasses == !oneGateUp,
-          label + (oneGateUp ? ": gate and up run in two passes" : ": gate and up run in one pass"));
   for (uint32_t r = 0; r < rows; ++r) {
     const float *x = b.input.data() + uint64_t{r} * kHidden;
     // Routes: the fp64 top-k by descending score, ascending id; the GPU's fp32
