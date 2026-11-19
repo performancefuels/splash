@@ -1,0 +1,86 @@
+name: Build M1/M2 1.7 port
+
+on:
+  push:
+    branches: [build/1.7.0-m1.0]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Build and package splash 1.7.0-m1.0 (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [xcode-27, macos-26]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Select newest Xcode and report tools
+        run: |
+          set -x
+          newest=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          sudo xcode-select -s "$newest"
+          xcodebuild -version
+          xcrun -sdk macosx metal --version || true
+          xcrun -sdk macosx metallib --version || true
+
+      - name: Download Metal toolchain component
+        continue-on-error: true
+        run: |
+          xcodebuild -downloadComponent MetalToolchain
+          xcrun -sdk macosx metal --version
+
+      - name: Build engine and metallib
+        run: make -j4 PYTHON_CANDIDATES=python3
+
+      - name: Package runtime archive
+        run: make package RELEASE_VERSION=1.7.0-m1.0 PYTHON_CANDIDATES=python3
+
+      - name: Show artefacts
+        run: ls -lh dist && cat dist/*.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: splash-1.7.0-m1.0-${{ matrix.runner }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+      # The Metal tests run on the destination Mac, not on the runner's
+      # paravirtual GPU: build their binaries and libraries here, where the
+      # Metal compiler is, and hand them over with the production libraries.
+      - name: Build the engine tests and their Metal libraries
+        run: |
+          targets=$(make -pn test-engine-metal PYTHON_CANDIDATES=python3 2>/dev/null \
+            | sed -n -E 's/^TEST_METAL_TARGETS :?= //p' | tr ' ' '\n' \
+            | grep -E '^build/(engine-tests/)?[A-Za-z0-9._-]+$' | sort -u | tr '\n' ' ')
+          make -j4 PYTHON_CANDIDATES=python3 $targets
+          shasum -a 256 build/*.metallib build/engine-tests/*.metallib build/splash > build/engine-tests/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: splash-1.7.0-m1.0-engine-tests-${{ matrix.runner }}
+          path: |
+            build/splash
+            build/*.metallib
+            build/engine-tests/
+            !build/engine-tests/**/*.o
+            !build/engine-tests/**/*.d
+            !build/engine-tests/**/*.air
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Engine tests (CPU)
+        run: make test-engine-cpu PYTHON_CANDIDATES=python3
+
+      - name: Python checks
+        run: make check-python PYTHON_CANDIDATES=python3
