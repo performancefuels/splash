@@ -192,7 +192,6 @@ def parse_expert_memory(value):
     return _memory_size(value, "16G", ("off",))
 
 
-
 def parse_expert_floor(value):
     return _memory_size(value, "12G", ())
 
@@ -205,6 +204,7 @@ def parse_expert_ahead_readers(value):
     if not 1 <= readers <= 32:
         raise argparse.ArgumentTypeError("must be an integer from 1 to 32")
     return readers
+
 
 def parse_sparse_kv_memory(value):
     return _memory_size(value, "1200M", ())
@@ -1109,6 +1109,7 @@ def check_serve_arguments(parser, args):
         and args.expert_floor > args.expert_memory
     ):
         parser.error("--expert-floor cannot exceed --expert-memory")
+
 
 def serve_argv(args):
     """The server's command line for the shared options `args` sets to other
