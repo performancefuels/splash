@@ -170,6 +170,24 @@ OPTIONS = {
         },
         ("0", "bad", "-2G"),
     ),
+    "--expert-floor": (
+        values(
+            "--expert-floor",
+            {"auto": None, "AUTO": None, "512M": 512 * 1024**2, "12G": 12 * 1024**3},
+            (),
+        )[0]
+        + [(["--expert-floor=12G", "--expert-memory=16G"], 12 * 1024**3)],
+        [
+            ["--expert-floor=12G", "--expert-memory=off"],
+            ["--expert-floor=20G", "--expert-memory=16G"],
+            *values("--expert-floor", {}, ("0", "off", "bad", "-2G"))[1],
+        ],
+    ),
+    "--expert-ahead-readers": values(
+        "--expert-ahead-readers",
+        {"1": 1, "4": 4, "8": 8, "32": 32},
+        ("0", "-1", "33", "auto", "bad"),
+    ),
     "--sparse-kv-memory": values(
         "--sparse-kv-memory",
         {"auto": None, "AUTO": None, "1200M": 1200 * 1024**2},

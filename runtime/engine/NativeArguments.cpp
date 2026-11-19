@@ -180,6 +180,16 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       result.pleMemory = parseStreamedSetting(option, value);
     } else if (option == "--expert-memory") {
       result.expertMemory = parseStreamedSetting(option, value);
+    } else if (option == "--expert-floor") {
+      uint64_t bytes = 0;
+      if (value != "auto" && !parsePositive(value, bytes))
+        throw UsageError("--expert-floor requires a positive byte count or auto");
+      result.expertFloor = bytes ? std::optional<uint64_t>(bytes) : std::nullopt;
+    } else if (option == "--expert-ahead-readers") {
+      uint32_t readers = 0;
+      if (!parsePositive(value, readers) || readers > model::kSsdReaders)
+        throw UsageError("--expert-ahead-readers requires an integer in [1, " + std::to_string(model::kSsdReaders) + "]");
+      result.expertAheadReaders = readers;
     } else if (option == "--sparse-kv-memory") {
       uint64_t bytes = 0;
       if (value != "auto" && !parsePositive(value, bytes))
@@ -248,6 +258,11 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
     throw UsageError("--ane-ffn-share requires --ane on");
   if (!result.cacheRoot.empty() && !result.persistentCache)
     throw UsageError("--cache-dir requires --persistent-cache on");
+  if (result.expertFloor && result.expertMemory.mode == StreamedSetting::Mode::Off)
+    throw UsageError("--expert-floor cannot be used with --expert-memory off");
+  if (result.expertFloor && result.expertMemory.mode == StreamedSetting::Mode::Size &&
+      *result.expertFloor > result.expertMemory.bytes)
+    throw UsageError("--expert-floor cannot exceed --expert-memory");
   result.modelRoot = requireModelRoot(argv[2]);
   model::ModelDescriptor inspected = inspectModel(result.modelRoot);
   result.maxContext = parseMaxContext(argv[3]);

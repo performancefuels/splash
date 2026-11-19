@@ -45,6 +45,9 @@ struct StreamedMemoryInputs final {
   uint32_t relaunchContextTokens = 0;
   StreamedPart experts;
   StreamedPart table;
+  // --expert-floor: the minimum bytes a streamed experts' store keeps under
+  // pressure; none leaves the floor to the automatic policy.
+  std::optional<uint64_t> expertFloorBytes;
   // The row cache an automatic table takes at most
   // (model::StreamableWeights::tableShareBytes).
   uint64_t tableShareBytes = 0;

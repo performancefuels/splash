@@ -207,6 +207,13 @@ void testServerCommandLines(const char *path) {
       {"expert_memory_off", [](NativeArguments &read) { read.expertMemory = {StreamedSetting::Mode::Off, 0}; }},
       // Auto is the engine's default, which the server leaves out.
       {"expert_memory_auto", [](NativeArguments &) {}},
+      {"expert_floor",
+       [](NativeArguments &read) {
+         read.expertMemory = {StreamedSetting::Mode::Size, 16 * kGiB};
+         read.expertFloor = 12 * kGiB;
+       }},
+      {"expert_floor_auto", [](NativeArguments &) {}},
+      {"expert_ahead_readers", [](NativeArguments &read) { read.expertAheadReaders = 8; }},
       {"sparse_kv_memory", [](NativeArguments &read) { read.sparseKvMemory = 1200 * (kGiB >> 10); }},
   };
   // Every field but the model inspected from the directory, whose RoPE
@@ -230,7 +237,8 @@ void testServerCommandLines(const char *path) {
            read.aneFfnMinimumRows == meant.aneFfnMinimumRows &&
            read.prefillCommandMilliseconds == meant.prefillCommandMilliseconds &&
            read.prefillBoundPerBuffer == meant.prefillBoundPerBuffer && read.pleMemory == meant.pleMemory &&
-           read.expertMemory == meant.expertMemory && read.sparseKvMemory == meant.sparseKvMemory &&
+           read.expertMemory == meant.expertMemory && read.expertFloor == meant.expertFloor &&
+           read.expertAheadReaders == meant.expertAheadReaders && read.sparseKvMemory == meant.sparseKvMemory &&
            read.kvSpillAlways == meant.kvSpillAlways && read.kvWindowTrim == meant.kvWindowTrim &&
            read.verifyRows == meant.verifyRows && read.int8Activations == meant.int8Activations;
   };
@@ -300,9 +308,10 @@ void testContendedPrefillRows() {
 void testStreamedMemoryAndSpill() {
   const ModelDirectory model;
   const NativeArguments automatic =
-      parse(model, {"auto", "auto", "--expert-memory", "auto", "--ple-memory", "auto", "--sparse-kv-memory", "auto"});
-  require(automatic.expertMemory == StreamedSetting{} && automatic.pleMemory == StreamedSetting{} &&
-              !automatic.sparseKvMemory && !automatic.kvSpillAlways,
+      parse(model, {"auto", "auto", "--expert-memory", "auto", "--expert-floor", "auto", "--ple-memory", "auto",
+                    "--sparse-kv-memory", "auto"});
+  require(automatic.expertMemory == StreamedSetting{} && !automatic.expertFloor && automatic.pleMemory == StreamedSetting{} &&
+              !automatic.sparseKvMemory && !automatic.kvSpillAlways && automatic.expertAheadReaders == 4,
           "auto did not leave the stores to the planner");
   require(parse(model, {"auto", "auto", "--kv-spill", "always"}).kvSpillAlways, "--kv-spill always was not read");
 }
@@ -368,6 +377,15 @@ void testRefusals() {
   for (const char *size : {"0", "16G", "Auto", ""})
     refuses({"auto", "auto", "--expert-memory", size},
             "--expert-memory requires a positive byte count, auto or off");
+  for (const char *size : {"0", "off", "12G", ""})
+    refuses({"auto", "auto", "--expert-floor", size}, "--expert-floor requires a positive byte count or auto");
+  refuses({"auto", "auto", "--expert-memory", "off", "--expert-floor", "1073741824"},
+          "--expert-floor cannot be used with --expert-memory off");
+  refuses({"auto", "auto", "--expert-memory", "1073741824", "--expert-floor", "2147483648"},
+          "--expert-floor cannot exceed --expert-memory");
+  for (const char *readers : {"0", "-1", "33", "auto", ""})
+    refuses({"auto", "auto", "--expert-ahead-readers", readers},
+            "--expert-ahead-readers requires an integer in [1, 32]");
   for (const char *size : {"0", "off", "1200M", ""})
     refuses({"auto", "auto", "--sparse-kv-memory", size}, "--sparse-kv-memory requires a positive byte count or auto");
   for (const char *spill : {"never", "auto", ""})

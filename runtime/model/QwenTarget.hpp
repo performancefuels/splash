@@ -449,6 +449,10 @@ public:
 
   // The step scratch the target allocated itself (qwenTargetScratchBytes).
   [[nodiscard]] virtual QwenTargetScratchBytes allocatedScratchBytes() const noexcept;
+  [[nodiscard]] virtual uint64_t prefillScratchBytes() const noexcept;
+  [[nodiscard]] virtual bool prefillScratchReleased() const noexcept;
+  virtual void releasePrefillScratch();
+  virtual void restorePrefillScratch();
 
   [[nodiscard]] const ops::Projection &
   vocabularyProjection() const noexcept;

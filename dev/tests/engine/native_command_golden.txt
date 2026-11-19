@@ -52,4 +52,7 @@ ple_memory_off | --ple-memory off | auto auto --ple-memory off
 expert_memory | --expert-memory 16G | auto auto --expert-memory 17179869184
 expert_memory_off | --expert-memory off | auto auto --expert-memory off
 expert_memory_auto | --expert-memory auto --ple-memory auto | auto auto
+expert_floor | --expert-memory 16G --expert-floor 12G | auto auto --expert-memory 17179869184 --expert-floor 12884901888
+expert_floor_auto | --expert-floor auto --expert-ahead-readers 4 | auto auto
+expert_ahead_readers | --expert-ahead-readers 8 | auto auto --expert-ahead-readers 8
 sparse_kv_memory | --sparse-kv-memory 1200M | auto auto --sparse-kv-memory 1258291200

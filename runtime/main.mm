@@ -153,7 +153,8 @@ void printUsage(std::string_view executable) {
       " [--max-cache-disk-writes BYTES]"
       " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]"
       " [--activations auto|bf16] [--relaunch-context TOKENS] [--ple-memory BYTES|auto|off]"
-      " [--expert-memory BYTES|auto|off] [--sparse-kv-memory BYTES|auto]"
+      " [--expert-memory BYTES|auto|off] [--expert-floor BYTES|auto]"
+      " [--expert-ahead-readers READERS] [--sparse-kv-memory BYTES|auto]"
       " [--kv-spill always] [--kv-window-trim on|off] [--verify-rows auto|all]"
       " [--prefill-mode bounded|full] [--prefill-bound-ms MILLISECONDS]"
       " [--prefill-bound-scope buffer|command] [--contended-prefill-rows ROWS]");
@@ -239,6 +240,8 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.relaunchContext = arguments.relaunchContext;
   config.resources.pleMemory = arguments.pleMemory;
   config.resources.expertMemory = arguments.expertMemory;
+  config.resources.expertFloor = arguments.expertFloor;
+  config.resources.expertAheadReaders = arguments.expertAheadReaders;
   config.resources.sparseKvMemory = arguments.sparseKvMemory;
   config.resources.kvSpillAlways = arguments.kvSpillAlways;
   config.resources.kvWindowTrim = arguments.kvWindowTrim;

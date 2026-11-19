@@ -551,6 +551,9 @@ public:
   // One growth pass. True when a pool grew.
   bool grow(uint64_t freeBytes, const GrowthHost &host);
 
+  // Releases up to `bytes` from non-rebuild-only elastic pools above their
+  // floors so host-exempt allocations protect the system reserve.
+  uint64_t releasePoolsAboveFloor(uint64_t bytes);
   // The accounts, owed bytes, claims and count checks.
   void fill(MemoryGovernorSnapshot &snapshot, uint64_t chargedBytes) const;
 

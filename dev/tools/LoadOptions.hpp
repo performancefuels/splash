@@ -47,14 +47,28 @@ namespace splash::tools {
 // Throws std::invalid_argument for a value that is not a size.
 [[nodiscard]] inline bool takeLoadOption(std::string_view option, std::string_view value,
                                          model::ModelLoadOptions &options) {
+  if (option == "--expert-ahead-readers") {
+    uint32_t count = 0;
+    const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), count);
+    if (error != std::errc{} || end != value.data() + value.size() || !count || count > model::kSsdReaders)
+      throw std::invalid_argument("--expert-ahead-readers takes an integer in [1, 32]");
+    options.expertAheadReaders = count;
+    return true;
+  }
   const bool experts = option == "--expert-memory";
-  if (!experts && option != "--ple-memory") return false;
+  const bool floor = option == "--expert-floor";
+  if (!experts && !floor && option != "--ple-memory") return false;
   const uint64_t bytes = parseBytes(value);
-  if (!bytes) throw std::invalid_argument(std::string(option) + " takes a size such as " + (experts ? "16G" : "2G"));
-  if (experts)
-    options.expertMemoryBytes = options.expertFloorBytes = bytes;
-  else
+  if (!bytes)
+    throw std::invalid_argument(std::string(option) + " takes a size such as " + (experts || floor ? "16G" : "2G"));
+  if (experts) {
+    options.expertMemoryBytes = bytes;
+    if (!options.expertFloorBytes) options.expertFloorBytes = bytes;
+  } else if (floor) {
+    options.expertFloorBytes = bytes;
+  } else {
     options.streamedTableBytes = bytes;
+  }
   return true;
 }
 

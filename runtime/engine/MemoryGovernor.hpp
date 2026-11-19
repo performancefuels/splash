@@ -201,6 +201,13 @@ public:
   // whether or not the limit does too, EngineBudget when only the limit
   // does. A refusal records what the claim lacks (need).
   [[nodiscard]] metal::AllocationAdmission allocationAdmission() noexcept;
+  // Whether pool units above their floors go, short of critical pressure,
+  // before a request in service or the host's own use takes the host below
+  // its reserve. A store whose floor the server set (--expert-floor) holds
+  // the rest only as the host leaves it; without one a store is kept through
+  // a host episode, since each chunk it gives up costs expert reads from the
+  // SSD for the rest of the run.
+  void yieldPoolsToHostReserve(bool yields) noexcept { poolsYieldToHostReserve_ = yields; }
   void setPressure(MemoryPressure pressure) noexcept;
   // What the governor makes of a fresh sample of the host. Reading it
   // changes nothing: the host's band moves only with the samples a
@@ -375,6 +382,7 @@ private:
   uint64_t limitBytes_ = 0;
   uint64_t hostReserveBytes_ = 0;
   uint64_t hostSpareReserveBytes_ = 0;
+  bool poolsYieldToHostReserve_ = false;
   HostMemoryProvider hostMemory_;
   uint64_t untrackedReserveBytes_ = 0;
   uint64_t hostHeldBytes_ = 0;

@@ -149,6 +149,8 @@ struct ExpertStoreOptions final {
   // size needs larger ones to fit the expert kernels' table
   // (streamedExpertChunkLayout).
   uint64_t elasticChunkBytes = kExpertElasticChunkBytes;
+  // The background SSD readers a read-ahead starts on at once.
+  unsigned aheadReaders = kDefaultExpertAheadReaders;
 };
 
 class ExpertStore final : public ops::MoeExpertStream, public WeightMemory {
@@ -181,6 +183,7 @@ public:
   void bind(uint32_t block, ops::BlockMoeWeights &weights);
   void addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLoadPart> parts, uint32_t block,
                const std::function<void()> &beside = {}) const override;
+  [[nodiscard]] uint32_t liveSlots(uint32_t block) const override;
   [[nodiscard]] ExpertStoreStats stats() const;
   // The bytes its loads read from the sources, of both phases, as the last
   // round published them (ExpertStoreStats::Use::readBytes): a command's

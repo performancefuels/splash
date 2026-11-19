@@ -1121,6 +1121,8 @@ private:
   // end, which takes nothing where the lane holds it.
   [[nodiscard]] std::optional<Denied> reserveReads(Request &active, const BatchItem &scheduled,
                                                    const PlanContext &plan);
+  [[nodiscard]] std::optional<Denied> reservePrefill(Request &active, const BatchItem &scheduled,
+                                                     const PlanContext &plan);
   // What a command none of whose lanes runs does about the memory they were
   // refused (`denied`): waits for memory on its way back, makes the lane
   // that yields first yield, or, alone with nothing on its way back, ends

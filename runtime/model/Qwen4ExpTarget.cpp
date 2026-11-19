@@ -82,6 +82,10 @@ Qwen4ExpTarget::Qwen4ExpTarget(const Qwen4ExpWeights &weights, const QwenTargetG
 }
 
 QwenTargetScratchBytes Qwen4ExpTarget::allocatedScratchBytes() const noexcept { return steps_.allocatedBytes(); }
+uint64_t Qwen4ExpTarget::prefillScratchBytes() const noexcept { return steps_.prefillScratchBytes(); }
+bool Qwen4ExpTarget::prefillScratchReleased() const noexcept { return steps_.prefillScratchReleased(); }
+void Qwen4ExpTarget::releasePrefillScratch() { steps_.releasePrefillScratch(); }
+void Qwen4ExpTarget::restorePrefillScratch() { steps_.restorePrefillScratch(); }
 
 std::vector<uint32_t> Qwen4ExpTarget::verifyTableRows(const ops::LaneRows &rows) const {
   return steps_.verifyPleRows(rows);

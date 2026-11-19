@@ -2066,10 +2066,11 @@ void testDenseRuntimeBoundary(const char *metallibPath) {
   require(runtime->prefillWork(chunk, 0, 2) == model::CommandWork{.layerAttentionPairs = pairs} &&
               runtime->prefillWork(chunk, layers / 2, 1).attentionPairs == pairs,
           "a pass's work does not count its own layers' pairs and the heaviest layer's of the target");
-  require(poolNames(*runtime) == std::vector<std::string>{"vision_arena", "embeddings"},
-          "a model that serves vision does not have its vision arena and embeddings as pools");
-  require(runtime->pools()[0]->state().rebuildOnly && runtime->pools()[1]->state().rebuildOnly,
-          "the vision arena or the embeddings is not a pool whose units cost only their rebuild");
+  require(poolNames(*runtime) == std::vector<std::string>{"vision_arena", "embeddings", "prefill_scratch"},
+          "a model that serves vision does not have its vision arena, embeddings and prefill scratch as pools");
+  require(runtime->pools()[0]->state().rebuildOnly && runtime->pools()[1]->state().rebuildOnly &&
+              runtime->pools()[2]->state().rebuildOnly,
+          "the vision arena, embeddings or prefill scratch is not a pool whose units cost only their rebuild");
 }
 
 // A streamed MoE start's runtime, its store sized automatically: a prefill
@@ -2090,11 +2091,11 @@ void testStreamedRuntimeBoundary(RuntimeResourcesConfig moe) {
                                                            .streamsWeights = true,
                                                            .attentionPairs = kLayerPairs},
           "a streamed MoE runtime's command limits are not a group's rows in a pass a layer");
-  require(poolNames(*runtime) == std::vector<std::string>{"experts", "vision_arena", "embeddings"},
-          "a streamed MoE runtime's pools are not its store's and its vision's");
+  require(poolNames(*runtime) == std::vector<std::string>{"experts", "vision_arena", "embeddings", "prefill_scratch"},
+          "a streamed MoE runtime's pools are not its store's, its vision's and its prefill scratch");
   require(!runtime->pools()[0]->state().rebuildOnly && runtime->pools()[1]->state().rebuildOnly &&
-              runtime->pools()[2]->state().rebuildOnly,
-          "the store, which the lanes in service read through, is a pool a start may take, or its vision's are not");
+              runtime->pools()[2]->state().rebuildOnly && runtime->pools()[3]->state().rebuildOnly,
+          "the store, which the lanes in service read through, is a pool a start may take, or the rebuild pools are not");
   // The store starts at its floor: a unit it takes, then gives back.
   model::ElasticPool &experts = *runtime->pools()[0];
   metal::MetalBackend &backend = resources->backend();
@@ -2153,10 +2154,10 @@ void testSpilledRuntimeBoundary(const char *metallibPath) {
                                                            .streamsWeights = streamsExperts,
                                                            .attentionPairs = kLayerPairs},
           "a spilling Flash-Next runtime's command limits do not stream one lane's history");
-  std::vector<std::string> pools{"hot_kv", "kv_staging"};
+  std::vector<std::string> pools{"hot_kv", "kv_staging", "prefill_scratch"};
   if (streamsExperts) pools.insert(pools.begin(), "experts");
   require(poolNames(*runtime) == pools,
-          "a spilling Flash-Next runtime's pools are not its store's, hot block cache's and staging's");
+          "a spilling Flash-Next runtime's pools are not its store's, hot block cache's, staging's and prefill scratch");
   ModelRequest request;
   const std::vector<uint32_t> prompt(2 * kChunk, 7);
   request.id = 911;
@@ -2216,6 +2217,18 @@ void testSpilledRuntimeBoundary(const char *metallibPath) {
   runtime->end(request.id);
   require(!staging.state().currentBytes, "the staging stayed once every request it was reserved for left");
   runtime->end(912);
+  model::ElasticPool &prefillPool = *runtime->pools().back();
+  const uint64_t prefillCap = prefillPool.state().capBytes;
+  require(prefillCap > 0 && !prefillPool.state().currentBytes &&
+              reads.prefillScratchShortfall() == prefillCap,
+          "prefill scratch stayed allocated after the preceding prompt ended");
+  runtime->beginColdRequest(request, 0);
+  require(reads.reservePrefillScratch(request.id).granted() && prefillPool.state().currentBytes == prefillCap &&
+              !reads.prefillScratchShortfall() && !prefillPool.release(UINT64_MAX),
+          "reserved prefill scratch did not restore and stay held for an incomplete prompt");
+  runtime->end(request.id);
+  require(!prefillPool.state().currentBytes && reads.prefillScratchShortfall() == prefillCap,
+          "prefill scratch stayed allocated after every prompt that reserved it left");
 }
 
 // The engine allocates for its requests' claims in the governor's ledger

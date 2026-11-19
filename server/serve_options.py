@@ -192,6 +192,20 @@ def parse_expert_memory(value):
     return _memory_size(value, "16G", ("off",))
 
 
+
+def parse_expert_floor(value):
+    return _memory_size(value, "12G", ())
+
+
+def parse_expert_ahead_readers(value):
+    try:
+        readers = int(value)
+    except ValueError:
+        readers = 0
+    if not 1 <= readers <= 32:
+        raise argparse.ArgumentTypeError("must be an integer from 1 to 32")
+    return readers
+
 def parse_sparse_kv_memory(value):
     return _memory_size(value, "1200M", ())
 
@@ -611,6 +625,33 @@ SERVE_OPTIONS = (
             "see streamed experts)",
         ),
         engine=EngineArgument("--expert-memory"),
+        needs="experts",
+    ),
+    ServeOption(
+        "--expert-floor",
+        "memory",
+        dict(
+            type=parse_expert_floor,
+            default=None,
+            metavar="SIZE",
+            help="minimum RAM floor the routed-experts store keeps under memory "
+            "pressure when streaming, e.g. 12G, growing toward --expert-memory "
+            "as host headroom allows (default: auto)",
+        ),
+        engine=EngineArgument("--expert-floor"),
+        needs="experts",
+    ),
+    ServeOption(
+        "--expert-ahead-readers",
+        "memory",
+        dict(
+            type=parse_expert_ahead_readers,
+            default=4,
+            metavar="N",
+            help="background SSD reader threads used by streamed expert "
+            "read-ahead, from 1 to 32 (default: 4)",
+        ),
+        engine=EngineArgument("--expert-ahead-readers"),
         needs="experts",
     ),
     ServeOption(
@@ -1060,6 +1101,14 @@ def check_serve_arguments(parser, args):
             "(SPLASH_REASONING_EFFORT) leaves none: it sets every request's"
         )
 
+    if args.expert_floor is not None and args.expert_memory == "off":
+        parser.error("--expert-floor cannot be used with --expert-memory off")
+    if (
+        args.expert_floor is not None
+        and isinstance(args.expert_memory, int)
+        and args.expert_floor > args.expert_memory
+    ):
+        parser.error("--expert-floor cannot exceed --expert-memory")
 
 def serve_argv(args):
     """The server's command line for the shared options `args` sets to other

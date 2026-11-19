@@ -1624,6 +1624,22 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
   // (gainsIndexPages), as a pass streams what it holds then. It is reserved
   // once every lane has its KV, since a lane's growth may release the pages
   // of lanes admitted before it (EngineVictims::releases).
+  if (prefill && !admitted.empty()) {
+    std::vector<BatchItem> kept;
+    kept.reserve(admitted.size());
+    for (const BatchItem &scheduled : admitted) {
+      Request &active = request(scheduled.requestId);
+      const std::optional<Denied> memory = reservePrefill(active, scheduled, context);
+      if (commandTaken())
+        return Prepared::Replan;
+      if (memory) {
+        denied.push_back(*memory);
+        continue;
+      }
+      kept.push_back(scheduled);
+    }
+    admitted = std::move(kept);
+  }
   if (spill) {
     std::vector<BatchItem> kept;
     kept.reserve(admitted.size());

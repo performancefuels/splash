@@ -255,6 +255,7 @@ public:
   virtual ~MoeExpertStream() = default;
   virtual void addLoad(metal::CommandGraph &graph, std::span<const MoeLoadPart> parts, uint32_t block,
                        const std::function<void()> &beside = {}) const = 0;
+  [[nodiscard]] virtual uint32_t liveSlots(uint32_t block) const = 0;
 };
 
 // The tiles of a step's routes, sorted by expert into tiles of at most

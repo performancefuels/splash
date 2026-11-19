@@ -377,7 +377,8 @@ bool keepsFloor(const model::ModelLoadOptions &loaded, double share, const model
 // and gives memory back down to, the model plan's `floorShare` of its slots:
 // all of them in a store --expert-memory sizes.
 void reportStreamedStores(const model::LoadedModel &loaded, const model::StreamableWeights &streamable,
-                          const StreamedSetting &experts, const StreamedSetting &table, double floorShare) {
+                          const StreamedSetting &experts, const StreamedSetting &table, double floorShare,
+                          bool explicitFloor) {
   const auto automatic = [](const StreamedSetting &setting, std::string_view option, std::string_view beside) {
     return setting.mode == StreamedSetting::Mode::Auto
                ? std::string(", all that ") + std::string(option) + " auto leaves it beside " + std::string(beside)
@@ -405,8 +406,11 @@ void reportStreamedStores(const model::LoadedModel &loaded, const model::Streama
         sized ? ", the " + std::to_string(experts.bytes / kMiB) + " MiB --expert-memory sets" +
                     (stats.capBytes / kMiB != experts.bytes / kMiB ? " in whole slots and chunks" : "")
               : automatic(experts, "--expert-memory", "the floors and the KV kept resident");
-    const std::string floor = std::to_string(stats.floorBytes / kMiB) + " MiB, " +
-                              std::to_string(static_cast<int>(std::lround(floorShare * 100))) + "% of its slots";
+    const std::string floor = std::to_string(stats.floorBytes / kMiB) + " MiB" +
+                              (explicitFloor
+                                   ? " (--expert-floor)"
+                                   : ", " + std::to_string(static_cast<int>(std::lround(floorShare * 100))) +
+                                         "% of its slots");
     const std::string shrinks =
         stats.floorBytes < stats.capBytes
             ? "; it starts at its floor and grows toward its cap as memory allows; while memory is short it gives "
@@ -793,6 +797,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
          .relaunchContextTokens = config.relaunchContext,
          .experts = {streamable.expertBytes, streamable.expertMinimumBytes, experts},
          .table = {streamable.tableBytes, streamable.tableMinimumBytes, table},
+         .expertFloorBytes = experts.mode == StreamedSetting::Mode::Loaded ? std::nullopt : config.expertFloor,
          .tableShareBytes = streamable.tableShareBytes,
          .hotCacheBytes = config.sparseKvMemory,
          .sparseKv = config.model.capabilities.sparseKv,
@@ -865,6 +870,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                                    .expertMemoryBytes = plan.expertBytes,
                                    .expertFloorBytes = plan.expertFloorBytes,
                                    .expertFloorShare = plan.expertFloorShare,
+                                   .expertAheadReaders = config.expertAheadReaders,
                                    .readers = readers,
                                    .releaseVisionWeights = plan.expertBytes != 0};
   };
@@ -885,6 +891,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                          "loads with the weights");
     reportIgnoredSetting("--expert-memory", config.expertMemory, streamable.expertBytes, config.model.name,
                          "routed experts", "load with their layers");
+    if (config.expertFloor)
+      reportIgnoredSetting("--expert-floor", {StreamedSetting::Mode::Size, *config.expertFloor},
+                           streamable.expertBytes, config.model.name, "routed experts", "load with their layers");
     // A table that may stream streams through its smallest row cache while
     // the target's files give its geometry.
     planArenas(model::plannedTargetGeometry(*backend, config.modelRoot, config.model,
@@ -1153,7 +1162,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       ready();
       memoryPlan = requirePlan();
     }
-    reportStreamedStores(loaded, streamable, config.expertMemory, config.pleMemory, loadOptions.expertFloorShare);
+    reportStreamedStores(loaded, streamable, config.expertMemory, config.pleMemory, loadOptions.expertFloorShare,
+                         config.expertFloor.has_value());
 
     // The governor holds the complete Metal footprint to the hard budget. The
     // plan budgets pipelines and driver allocations inside the pipeline and
@@ -1162,6 +1172,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // split only moves bytes from KV to fixed runtime memory, so the governor
     // is the same with it or without.
     auto memoryGovernor = std::make_unique<MemoryGovernor>(*backend, memoryPlan.breakdown(), config.hostMemory);
+    memoryGovernor->yieldPoolsToHostReserve(config.expertFloor.has_value());
     if (config.memoryPressure)
       memoryGovernor->setPressure(config.memoryPressure());
     // What the start allocates, the KV runway, the arenas and the warmup, is
@@ -1413,7 +1424,8 @@ model::RuntimeContext RuntimeResources::modelContext() {
       model::stepCostsKey(model_, *kvPages_, *stateStorage_, operators_, *backend_, cacheIdentity_.buildId);
   return {*backend_, model_, *kvPages_, *stateStorage_, operators_, aneFfn_.get(), blockCache_.get(),
           historyStream_.get(), verifyRows_, [key](uint32_t lanes) { return ane::recall(key + std::to_string(lanes)); },
-          [key](uint32_t lanes, std::string_view line) { ane::remember(key + std::to_string(lanes), line); }};
+          [key](uint32_t lanes, std::string_view line) { ane::remember(key + std::to_string(lanes), line); },
+          memoryGovernor_->allocationAdmission()};
 }
 
 EngineSpillConfig RuntimeResources::spillConfig() const noexcept {

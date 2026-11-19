@@ -29,6 +29,10 @@ public:
                  const ops::ExecutionPlans &operators, uint32_t prefillChunks);
 
   [[nodiscard]] QwenTargetScratchBytes allocatedScratchBytes() const noexcept override;
+  [[nodiscard]] uint64_t prefillScratchBytes() const noexcept override;
+  [[nodiscard]] bool prefillScratchReleased() const noexcept override;
+  void releasePrefillScratch() override;
+  void restorePrefillScratch() override;
   [[nodiscard]] std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph,
                                                            std::span<const QwenTargetPrefillChunk> chunks,
                                                            const kv::PageStorage &kv, SpilledKvReads &spilled,

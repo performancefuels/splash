@@ -870,6 +870,24 @@ uint64_t MemoryLedger::available(const ClaimSpec &spec, const Need &need, uint64
   return std::min(enough, saturatingSubtract(saturatingAdd(room, taken), held));
 }
 
+uint64_t MemoryLedger::releasePoolsAboveFloor(uint64_t bytes) {
+  if (!bytes) return 0;
+  uint64_t total = 0;
+  for (size_t index = 1; index < accounts_.size() && total < bytes; ++index) {
+    Account &account = accounts_[index];
+    if (!account.pool) continue;
+    const model::PoolState state = account.pool->state();
+    if (state.rebuildOnly || state.currentBytes <= state.floorBytes) continue;
+    const uint64_t freed = account.pool->release(bytes - total);
+    if (freed) {
+      ++account.shrinks;
+      total = saturatingAdd(total, freed);
+    }
+  }
+  if (total) quietSinceSeconds_ = nowSeconds_;
+  return total;
+}
+
 // Growth into the room beyond what waiting claims and the lanes' projected
 // growth hold, a pool at a time in registration order. Nothing grows while a
 // request's claim waits for memory, or its request to retry what the host

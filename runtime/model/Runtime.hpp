@@ -61,6 +61,8 @@ public:
   [[nodiscard]] uint64_t hotFloorBytes(uint32_t lanes) const override;
   [[nodiscard]] uint64_t hotFloorShortfall(std::span<const uint64_t> requestIds) const override;
   [[nodiscard]] ModelMemoryAdmission reserveSpilledReads(uint64_t requestId, SpilledReadNeed need) override;
+  [[nodiscard]] uint64_t prefillScratchShortfall() const override;
+  [[nodiscard]] ModelMemoryAdmission reservePrefillScratch(uint64_t requestId) override;
   [[nodiscard]] uint64_t releaseIdleBuffer(bool keepLane) noexcept override;
   [[nodiscard]] std::optional<std::string>
   provideMask(uint64_t requestId, std::span<const uint32_t> words, std::span<const uint32_t> forced) override;
@@ -68,6 +70,7 @@ public:
   [[nodiscard]] uint32_t prefillTailAlignment() const noexcept override;
   void end(uint64_t requestId) override;
 
+  void setWarmupHold(bool held) noexcept override;
   [[nodiscard]] WarmupStepResult warmupPrefill(uint32_t rows) override;
   [[nodiscard]] WarmupStepResult
   warmupDecodeBatch(uint32_t width) override;

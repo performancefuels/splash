@@ -139,10 +139,15 @@ Engine::LaneDemand Engine::laneDemand() const {
   // and one in prefill the staging of its history through its next command.
   // A Spill lane with none reads nothing spilled.
   std::vector<uint64_t> readers;
+  bool prefillScratchCounted = false;
   for (const auto &[id, peer] : requests_) {
     if (!peer.lane || peer.pendingEnd)
       continue;
     const bool prefill = scheduler_.phase(id) == Phase::Prefill;
+    if (prefill && !prefillScratchCounted) {
+      demand.bytes += model_.prefillScratchShortfall();
+      prefillScratchCounted = true;
+    }
     if (cache_.holdsIndexPages(id)) {
       readers.push_back(id);
       if (prefill)
@@ -270,7 +275,12 @@ uint32_t Engine::nextCommandPages(const Request &active) const {
 uint64_t Engine::readsShortfall(std::span<const uint64_t> lanes) const {
   uint64_t bytes = 0;
   std::vector<uint64_t> decoding;
+  bool prefillScratchCounted = false;
   for (const uint64_t id : lanes) {
+    if (scheduler_.phase(id) == Phase::Prefill && !prefillScratchCounted) {
+      bytes += model_.prefillScratchShortfall();
+      prefillScratchCounted = true;
+    }
     if (cache_.holdsIndexPages(id))
       continue;
     if (scheduler_.phase(id) == Phase::Prefill)
@@ -611,6 +621,17 @@ std::optional<Engine::Denied> Engine::reserveReads(Request &active, const BatchI
     return std::nullopt;
   return Denied{id, workEndOf(active, scheduled, plan.prefill), memory.denial, std::nullopt,
                 plan.prefill ? "prefill history staging" : "hot KV cache"};
+}
+
+std::optional<Engine::Denied> Engine::reservePrefill(Request &active, const BatchItem &scheduled,
+                                                     const PlanContext &plan) {
+  const uint64_t id = active.request.id;
+  ClaimSpec spec = claimFor(active, ClaimClass::InService);
+  spec.supersedes = plan.supersedes;
+  const auto memory = allocate([&] { return model_.reservePrefillScratch(id); }, spec, Refusal::Waits);
+  if (memory.admission.granted())
+    return std::nullopt;
+  return Denied{id, workEndOf(active, scheduled, plan.prefill), memory.denial, std::nullopt, "prefill scratch"};
 }
 
 Engine::Prepared Engine::refuse(std::span<const Denied> denied, const PlanContext &plan) {

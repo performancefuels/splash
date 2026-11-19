@@ -1051,6 +1051,33 @@ void testPlanSetsTheStoresFloor() {
             std::string("--expert-memory did not set the store's cap and floor ") +
                 (sized.tierWritable ? "where the run can spill" : "without an SSD cache that takes writes"));
   }
+  for (StreamedMemoryInputs decoupled : {inputs, unwritable}) {
+    decoupled.experts.setting = {StreamedSetting::Mode::Size, 8 * kGiB};
+    decoupled.expertFloorBytes = 5 * kGiB;
+    const StreamedMemoryPlan split = requirePlan(decoupled);
+    require(split.expertBytes == 8 * kGiB && split.expertFloorBytes == 5 * kGiB && split.expertFloorShare == 1.0,
+            "--expert-floor did not decouple the store's floor below --expert-memory");
+  }
+  {
+    StreamedMemoryInputs autoWithFloor = inputs;
+    autoWithFloor.expertFloorBytes = 5 * kGiB;
+    const StreamedMemoryPlan splitAuto = requirePlan(autoWithFloor);
+    require(splitAuto.expertBytes >= 5 * kGiB && splitAuto.expertFloorBytes == 5 * kGiB,
+            "--expert-floor with automatic --expert-memory did not set the store's byte floor");
+    StreamedMemoryInputs tooSmall = inputs;
+    tooSmall.expertFloorBytes = kGiB;
+    const StreamedMemoryResult smallFloor = planStreamedMemory(tooSmall);
+    require(!smallFloor.plan && smallFloor.error.find("--expert-floor of 1024 MiB is less than its smallest store") !=
+                                    std::string::npos,
+            "--expert-floor below smallest store was not refused");
+    StreamedMemoryInputs aboveCap = inputs;
+    aboveCap.experts.setting = {StreamedSetting::Mode::Size, 8 * kGiB};
+    aboveCap.expertFloorBytes = 10 * kGiB;
+    const StreamedMemoryResult badCap = planStreamedMemory(aboveCap);
+    require(!badCap.plan && badCap.error.find("--expert-floor of 10240 MiB exceeds --expert-memory") !=
+                                std::string::npos,
+            "--expert-floor above --expert-memory was not refused");
+  }
 
   const EngineMemoryPlan mains = test::requireMemoryPlan(
       deviceOf(kM6), kFlashNext.profile(limit.expertBytes, limit.tableBytes, limit.spill));

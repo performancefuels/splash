@@ -35,6 +35,8 @@ inline constexpr double kExpertFloorShare = 0.85;
 // About the most bytes an elastic chunk takes by default, unless the size
 // needs larger ones to fit the expert kernels' table (MOE_EXPERT_MAX_CHUNKS).
 inline constexpr uint64_t kExpertElasticChunkBytes = 1ULL << 30;
+// The background readers an expert store starts its read-aheads on by default.
+inline constexpr unsigned kDefaultExpertAheadReaders = 4;
 
 // A slot's bytes of each plane of a size's experts: gate's, up's and down's
 // plane0, plane1 and meta, each plane in a region of its own in a chunk.

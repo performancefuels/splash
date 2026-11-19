@@ -228,7 +228,23 @@ QwenTargetScratchBytes Qwen4Steps::scratchBytes(const QwenTargetGeometry &geomet
 }
 
 QwenTargetScratchBytes Qwen4Steps::allocatedBytes() const noexcept {
-  return {prefill_.sizeBytes(), decode_.sizeBytes()};
+  return {prefill_.allocatedBytes(), decode_.allocatedBytes()};
+}
+
+void Qwen4Steps::releasePrefillScratch() {
+  if (prefill_ && !prefillReleased_) {
+    backend_.releaseMemory(prefill_);
+    prefillReleased_ = true;
+  }
+}
+
+void Qwen4Steps::restorePrefillScratch() {
+  if (prefill_ && prefillReleased_) {
+    backend_.restoreMemory(prefill_);
+    const metal::MetalBuffer zeros = prefillScratch(0).zeros;
+    std::memset(zeros.contents(), 0, zeros.sizeBytes());
+    prefillReleased_ = false;
+  }
 }
 
 Qwen4Scratch Qwen4Steps::prefillScratch(uint32_t index) const {

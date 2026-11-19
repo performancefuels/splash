@@ -105,6 +105,10 @@ public:
                                                            uint32_t prefillChunks);
   // What the constructor allocated, scratchBytes' of its geometry.
   [[nodiscard]] QwenTargetScratchBytes allocatedBytes() const noexcept;
+  [[nodiscard]] uint64_t prefillScratchBytes() const noexcept { return prefill_ ? prefill_.sizeBytes() : 0; }
+  [[nodiscard]] bool prefillScratchReleased() const noexcept { return prefillReleased_; }
+  void releasePrefillScratch();
+  void restorePrefillScratch();
 
   // Chunk `index`'s scratch of a prefill command.
   [[nodiscard]] Qwen4Scratch prefillScratch(uint32_t index) const;
@@ -187,6 +191,7 @@ private:
   std::array<uint64_t, ExecutionLimits::maximumBatchWidth> preparedPositions_{};
   // Row ids of a read-ahead, kept between commands for their allocation.
   std::vector<uint32_t> ahead_;
+  bool prefillReleased_ = false;
 };
 
 } // namespace splash::model

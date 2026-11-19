@@ -289,8 +289,15 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
   // The store's floor: every slot of a store a size sets, which is all of
   // it, and of an automatic store the share this plan's spill gives
   // (expertFloorShare; model::ExpertStoreOptions).
-  plan.expertFloorBytes = experts.sized ? experts.charged : 0;
-  plan.expertFloorShare = experts.sized ? 1.0 : expertFloorShare(spill.enabled);
+  if (plan.expertBytes) {
+    if (in.expertFloorBytes) {
+      plan.expertFloorBytes = std::min(*in.expertFloorBytes, plan.expertBytes);
+      plan.expertFloorShare = 1.0;
+    } else {
+      plan.expertFloorBytes = experts.sized ? experts.charged : 0;
+      plan.expertFloorShare = experts.sized ? 1.0 : expertFloorShare(spill.enabled);
+    }
+  }
   plan.tableBytes = table.streams ? table.charged : 0;
   if (table.automatic) {
     const uint64_t take =
@@ -316,9 +323,26 @@ StreamedMemoryResult planStreamedMemory(const StreamedMemoryInputs &in) {
       (in.sparseKv && !in.sparseKv->laneSlots()))
     return {std::nullopt, "invalid memory planner inputs"};
   std::string error;
-  const std::optional<Part> experts = resolve(in.experts, "--expert-memory", error);
+  std::optional<Part> experts = resolve(in.experts, "--expert-memory", error);
   const std::optional<Part> table = experts ? resolve(in.table, "--ple-memory", error) : std::nullopt;
   if (!table) return {std::nullopt, error};
+  if (in.expertFloorBytes) {
+    if (in.experts.setting.mode == StreamedSetting::Mode::Off)
+      return {std::nullopt, "--expert-floor cannot be used with --expert-memory off"};
+    const uint64_t floor = *in.expertFloorBytes;
+    if (in.experts.allBytes) {
+      if (floor < in.experts.minimumBytes && floor < in.experts.allBytes)
+        return {std::nullopt, "--expert-floor of " + std::to_string(floor / kMiB) +
+                                  " MiB is less than its smallest store, " +
+                                  std::to_string((in.experts.minimumBytes + kMiB - 1) / kMiB) + " MiB"};
+      if (experts->sized && in.experts.setting.bytes < in.experts.allBytes && floor > experts->charged)
+        return {std::nullopt, "--expert-floor of " + std::to_string(floor / kMiB) +
+                                  " MiB exceeds --expert-memory of " + std::to_string(experts->charged / kMiB) +
+                                  " MiB"};
+      if (experts->automatic)
+        experts->charged = std::min(in.experts.allBytes, std::max(experts->charged, floor));
+    }
+  }
   // The arenas of the parts set to stream, and where that plan streams
   // more, those of the parts it streams: a part that streams with smaller
   // arenas streams with larger ones, so a plan streams no more than the

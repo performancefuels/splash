@@ -89,6 +89,8 @@ struct NativeArguments final {
   // (RuntimeResourcesConfig::pleMemory, expertMemory).
   StreamedSetting pleMemory;
   StreamedSetting expertMemory;
+  std::optional<uint64_t> expertFloor;
+  uint32_t expertAheadReaders = model::kDefaultExpertAheadReaders;
   // --sparse-kv-memory BYTES|auto: the target of a block-sparse target's hot
   // block cache; none, auto, its floor (RuntimeResourcesConfig::sparseKvMemory).
   std::optional<uint64_t> sparseKvMemory;

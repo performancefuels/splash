@@ -587,6 +587,9 @@ struct Runtime::Impl {
   // its first pass, so a reservation for another prompt between its passes
   // leaves it the command's too.
   std::vector<uint64_t> stagingRequests;
+  std::vector<uint64_t> prefillRequests;
+  metal::AllocationAdmission admission;
+  bool warmupHold = false;
   // What one prefill command may hold (Runtime::commandLimits).
   const CommandLimits limits;
 
@@ -609,6 +612,30 @@ struct Runtime::Impl {
     uint64_t release(uint64_t bytes) override {
       if (!bytes || runtime_.stagingHeld()) return 0;
       return runtime_.releaseStaging();
+    }
+    metal::AllocationResult grow(const metal::AllocationAdmission &) override { return {}; }
+
+  private:
+    Impl &runtime_;
+  };
+
+  class PrefillScratchPool final : public ElasticPool {
+  public:
+    explicit PrefillScratchPool(Impl &runtime) noexcept : runtime_(runtime) {}
+    [[nodiscard]] PoolState state() const override {
+      const uint64_t current = runtime_.prefillScratchCurrentBytes();
+      const uint64_t cap = runtime_.prefillArena->scratchBytes() + runtime_.targetModel->prefillScratchBytes();
+      const bool held = runtime_.prefillHeld();
+      return {.name = "prefill_scratch",
+              .floorBytes = held ? current : 0,
+              .currentBytes = current,
+              .capBytes = cap,
+              .releaseUnitBytes = held ? 0 : current,
+              .rebuildOnly = true};
+    }
+    uint64_t release(uint64_t bytes) override {
+      if (!bytes || runtime_.prefillHeld()) return 0;
+      return runtime_.releasePrefillScratch();
     }
     metal::AllocationResult grow(const metal::AllocationAdmission &) override { return {}; }
 
@@ -691,6 +718,7 @@ struct Runtime::Impl {
   StagingPool stagingPool{*this};
   VisionArenaPool visionPool{*this};
   EmbeddingsPool embeddingsPool{*this};
+  PrefillScratchPool prefillPool{*this};
   std::vector<ElasticPool *> pools;
   // The step every decode cycle takes in place of the cycles' choice, each
   // of its rows verified, which such cycles do not teach: the start's decode
@@ -735,6 +763,7 @@ struct Runtime::Impl {
         draftModel(value.model.draft, value.backend, operators, targetModel->vocabularyProjection(),
                    geometry.target.draftVocabulary),
         aneFfn(value.aneFfn), blockCache(value.blockCache), historyStream(value.historyStream),
+        admission(std::move(value.admission)),
         limits(splash::model::commandLimits(geometry, aneFfn ? aneFfn->minimumRows() : 0)) {
     if (states.layout() != model.stateLayout(states.layout().target.format, states.layout().target.cachedCodes) ||
         kvPages.layout() != model.targetKvLayout(kvPages.layout().format) || !blockCache != !historyStream) {
@@ -790,6 +819,7 @@ struct Runtime::Impl {
       pools.push_back(&visionPool);
       pools.push_back(&embeddingsPool);
     }
+    pools.push_back(&prefillPool);
     preparePolicyPipelines();
   }
 
@@ -1025,6 +1055,66 @@ struct Runtime::Impl {
       return;
     if (std::ranges::none_of(stagingRequests, [this](uint64_t id) { return residentRequest(id); }))
       static_cast<void>(releaseStaging());
+  }
+
+  [[nodiscard]] uint64_t prefillScratchCurrentBytes() const noexcept {
+    return (prefillArena->released() ? 0 : prefillArena->scratchBytes()) +
+           (targetModel->prefillScratchReleased() ? 0 : targetModel->prefillScratchBytes());
+  }
+
+  [[nodiscard]] uint64_t prefillScratchMissingBytes() const noexcept {
+    return (prefillArena->released() ? prefillArena->scratchBytes() : 0) +
+           (targetModel->prefillScratchReleased() ? targetModel->prefillScratchBytes() : 0);
+  }
+
+  [[nodiscard]] bool prefillHeld() const noexcept {
+    if (warmupHold || backend.commandInFlight()) return true;
+    return std::ranges::any_of(prefillRequests, [this](uint64_t id) {
+      const auto holder = requests.find(id);
+      return holder != requests.end() && holder->second.resident &&
+             (!holder->second.promptComplete || holder->second.draftRebuild.has_value());
+    });
+  }
+
+  [[nodiscard]] ModelMemoryAdmission reservePrefill(uint64_t requestId) {
+    std::erase_if(prefillRequests, [this](uint64_t id) { return !residentRequest(id); });
+    if (std::ranges::find(prefillRequests, requestId) == prefillRequests.end())
+      prefillRequests.push_back(requestId);
+    const uint64_t missing = prefillScratchMissingBytes();
+    if (!missing)
+      return {.ok = true};
+    const metal::AllocationResult admitted = admission(missing, [this] {
+      const bool arenaWasReleased = prefillArena->released();
+      if (arenaWasReleased)
+        prefillArena->restore();
+      try {
+        if (targetModel->prefillScratchReleased())
+          targetModel->restorePrefillScratch();
+      } catch (...) {
+        if (arenaWasReleased)
+          prefillArena->release();
+        throw;
+      }
+    });
+    if (!admitted)
+      return {.ok = false, .allocationFailure = admitted.failure};
+    return {.ok = true};
+  }
+
+  uint64_t releasePrefillScratch() {
+    const uint64_t current = prefillScratchCurrentBytes();
+    prefillRequests.clear();
+    if (!current) return 0;
+    targetModel->releasePrefillScratch();
+    prefillArena->release();
+    return current;
+  }
+
+  void releaseLeftPrefill(bool completedToo = false) {
+    if (backend.commandInFlight() || prefillHeld())
+      return;
+    if (completedToo || std::ranges::none_of(prefillRequests, [this](uint64_t id) { return residentRequest(id); }))
+      static_cast<void>(releasePrefillScratch());
   }
 
   // A cancelled/suspended prompt may never reach its late image. Release
@@ -3469,6 +3559,7 @@ void Runtime::suspend(uint64_t requestId) {
   entry.promptComplete = false;
   entry.resident = false;
   impl_->releaseLeftStaging();
+  impl_->releaseLeftPrefill();
 }
 
 StateAdmission Runtime::resume(const ModelRequest &request) {
@@ -3614,6 +3705,7 @@ Runtime::submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
   case WorkKind::Prefill:
     return prefillAsync(plan, items, std::move(completion));
   case WorkKind::Decode:
+    impl_->releaseLeftPrefill(true);
     return decodeAsync(plan, items, std::move(completion));
   }
   throw std::logic_error("unknown model work kind");
@@ -3631,6 +3723,14 @@ Runtime::prefillAsync(const BatchPlan &plan,
   const QwenPrefillLayers layers = impl_->passLayers(plan);
   const bool begins = !layers.first, ends = layers.end == impl_->geometry.target.layers;
 
+  for (uint32_t lane = 0; lane < items.size(); ++lane) {
+    const ModelMemoryAdmission scratch = impl_->reservePrefill(items[lane].requestId);
+    if (!scratch.granted())
+      throw metal::MetalAllocationError(
+          std::string("unable to restore prefill scratch: ") +
+              metal::allocationFailureName(scratch.allocationFailure),
+          scratch.allocationFailure);
+  }
   std::array<Impl::Request *, kLaneCount> entries{};
   // Each request's draws before the chunk, which a rerun of it restores.
   std::array<uint64_t, kLaneCount> draws{};
@@ -4188,6 +4288,15 @@ ModelMemoryAdmission Runtime::reserveSpilledReads(uint64_t requestId, SpilledRea
   return impl_->blockCache->reserveLane(lane);
 }
 
+uint64_t Runtime::prefillScratchShortfall() const {
+  return impl_->prefillScratchMissingBytes();
+}
+
+ModelMemoryAdmission Runtime::reservePrefillScratch(uint64_t requestId) {
+  static_cast<void>(residentLane(requestId));
+  return impl_->reservePrefill(requestId);
+}
+
 uint64_t Runtime::releaseIdleBuffer(bool keepLane) noexcept {
   return impl_->states.releaseOneIdle(keepLane);
 }
@@ -4245,6 +4354,11 @@ void Runtime::end(uint64_t requestId) {
     impl_->releaseLane(found->second);
   impl_->requests.erase(found);
   impl_->releaseLeftStaging();
+  impl_->releaseLeftPrefill();
+}
+
+void Runtime::setWarmupHold(bool held) noexcept {
+  impl_->warmupHold = held;
 }
 
 namespace {
@@ -4629,7 +4743,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
 
 ModelMemoryActual Runtime::actualRuntimeMemory() const {
   const QwenTargetScratchBytes target = impl_->targetModel->allocatedScratchBytes();
-  return {impl_->states.actualAllocatedBytes(), impl_->prefillArena->bytes() + target.prefill,
+  return {impl_->states.actualAllocatedBytes(), impl_->prefillArena->allocatedBytes() + target.prefill,
           impl_->decodeArena->bytes() + target.decode, impl_->states.stagingBytes()};
 }
 

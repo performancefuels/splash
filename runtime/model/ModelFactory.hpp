@@ -50,6 +50,7 @@ struct ModelLoadOptions final {
   uint64_t expertMemoryBytes = 0;
   uint64_t expertFloorBytes = 0;
   double expertFloorShare = kExpertFloorShare;
+  unsigned expertAheadReaders = kDefaultExpertAheadReaders;
   std::shared_ptr<SsdReaders> readers;
   bool releaseVisionWeights = false;
 };
@@ -140,6 +141,7 @@ struct RuntimeContext final {
   // made, and remembering one; neither where every start measures them.
   std::function<std::optional<std::string>(uint32_t lanes)> recallStepCosts{};
   std::function<void(uint32_t lanes, std::string_view line)> rememberStepCosts{};
+  metal::AllocationAdmission admission = metal::admittedWithin;
 };
 
 // What the step costs a start's decode warmups measure follow

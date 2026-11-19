@@ -413,8 +413,18 @@ FreeResult MemoryGovernor::free(ClaimId claim, const Need &need) {
   // What the claim lacks stands: a refusal of what its takes allocate, as a
   // release's refill of the Index runway, says nothing of it.
   const Need refusal = ledger_.claim(claim).refusal;
-  const FreeResult result = ledger_.free(claim, need, roomBytes(), hostRule_.level(),
-                                         hostClass(ledger_.claim(claim).spec) == ClaimClass::InService);
+  const bool inService = hostClass(ledger_.claim(claim).spec) == ClaimClass::InService;
+  const FreeResult result = ledger_.free(claim, need, roomBytes(), hostRule_.level(), inService);
+  if (poolsYieldToHostReserve_ && inService && need.hostRefused) {
+    const uint64_t remaining = saturatingSubtract(need.bytes, result.nowBytes);
+    if (remaining) {
+      if (const std::optional<HostMemory> host = sampleHost();
+          host && saturatingSubtract(host->available, remaining) < hostReserveBytes_) {
+        static_cast<void>(ledger_.releasePoolsAboveFloor(
+            hostReserveBytes_ - saturatingSubtract(host->available, remaining)));
+      }
+    }
+  }
   ledger_.refused(claim, refusal);
   return result;
 }
@@ -491,8 +501,11 @@ bool MemoryGovernor::controlPass(double nowMilliseconds) {
   clockMilliseconds_ = nowMilliseconds;
   ledger_.setNow(nowMilliseconds / 1000.0);
   growthUnitBytes_ = ledger_.largestGrowthUnit();
-  sampleHostRule(sampleHost());
+  const std::optional<HostMemory> host = sampleHost();
+  sampleHostRule(host);
   const bool critical = hostRule_.level() == MemoryPressure::Critical;
+  if (poolsYieldToHostReserve_ && !critical && host && host->available < hostReserveBytes_)
+    static_cast<void>(ledger_.releasePoolsAboveFloor(hostReserveBytes_ - host->available));
   std::optional<FreeResult> pass;
   if (nowMilliseconds >= nextHostPassMilliseconds_) {
     const uint64_t refused = ledger_.hostRefusedWaitingBytes();

@@ -153,6 +153,8 @@ struct RuntimeResourcesConfig {
   // store. A size that holds every expert loads them with their layers and
   // says it is ignored, and so does a dense target.
   StreamedSetting expertMemory;
+  std::optional<uint64_t> expertFloor;
+  uint32_t expertAheadReaders = model::kDefaultExpertAheadReaders;
   // --sparse-kv-memory: the target of a spill-capable target's hot block
   // cache, at least its floor; none (auto) keeps its floor.
   std::optional<uint64_t> sparseKvMemory;

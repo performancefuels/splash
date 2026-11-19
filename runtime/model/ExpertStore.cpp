@@ -38,7 +38,7 @@ constexpr uint32_t kNoSlot = UINT32_MAX;
 // the SSD's full bandwidth, and a piece takes about 280 us, a quarter of
 // what it takes on eighteen.
 constexpr uint64_t kAheadPieceBytes = 512 << 10;
-constexpr unsigned kAheadReaders = 4;
+constexpr uint32_t kPrefillAheadPlaces = 4;
 // The rows a load stages its experts for in one round (Impl::cycleLoad),
 // predicting the next block's and keeping the GPU awake as a decode step's
 // load does: four lanes of a draft's block. On a 48 GB M5 Pro, staging for
@@ -353,8 +353,10 @@ struct ExpertStore::Impl {
     }
   };
 
-  Impl(metal::MetalBackend &backend, ops::MoeShape shape, Geometry geometry, std::shared_ptr<SsdReaders> readers)
-      : backend(backend), shape(shape), geometry(std::move(geometry)), readers(std::move(readers)) {}
+  Impl(metal::MetalBackend &backend, ops::MoeShape shape, Geometry geometry, std::shared_ptr<SsdReaders> readers,
+       unsigned aheadReaders)
+      : backend(backend), shape(shape), geometry(std::move(geometry)), readers(std::move(readers)),
+        aheadReaders(aheadReaders) {}
   // The readers of a read-ahead read into this store's memory: they end the
   // pieces they took before it goes.
   ~Impl() {
@@ -379,9 +381,13 @@ struct ExpertStore::Impl {
   [[nodiscard]] bool longChunk(uint32_t rows) const noexcept {
     return uint64_t{rows} * shape.expertsPerToken >= kLongChunkRoutes * shape.experts;
   }
+  [[nodiscard]] uint32_t liveSlots(uint32_t block) const noexcept {
+    const Size &size = sizes[blocks.at(block).size];
+    return size.chunkLayout.first(size.chunks.liveChunks());
+  }
   // The experts a load of `rows` rows may route.
   [[nodiscard]] uint64_t routable(uint32_t block, uint32_t rows) const noexcept {
-    const uint32_t bound = std::min(shape.experts, sizes[blocks[block].size].slots);
+    const uint32_t bound = std::min(shape.experts, liveSlots(block));
     return std::min<uint64_t>(bound, uint64_t{rows} * shape.expertsPerToken);
   }
   // The places a round of a load of `rows` rows that may route `routable`
@@ -390,7 +396,7 @@ struct ExpertStore::Impl {
   // half of them.
   [[nodiscard]] uint32_t roundPlaces(uint32_t rows, uint64_t routable) const noexcept {
     if (cycleLoad(rows) && routable <= places.count) return places.count;
-    if (geometry.layoutOf.size() > 8 && places.count > kAheadReaders) return places.count - kAheadReaders;
+    if (geometry.layoutOf.size() > 8 && places.count > kPrefillAheadPlaces) return places.count - kPrefillAheadPlaces;
     return places.count / 2;
   }
   [[nodiscard]] bool streams(uint32_t block) const noexcept { return sizes[blocks[block].size].streams; }
@@ -462,6 +468,7 @@ struct ExpertStore::Impl {
   const ops::MoeShape shape;
   const Geometry geometry;
   const std::shared_ptr<SsdReaders> readers;
+  const unsigned aheadReaders;
   // What holds the sources open, and their checks (StreamedBlocks).
   std::shared_ptr<const void> files;
   std::vector<std::function<void()>> checks;
@@ -802,7 +809,7 @@ void ExpertStore::Impl::startAhead() {
           const Piece &piece = ahead.reads.pieces[task];
           readPiece(ahead.reads.groups[piece.group], piece);
         },
-        kAheadReaders);
+        aheadReaders);
   } catch (const std::exception &error) {
     plan.block = kNoSlot;
     if (failure.empty()) failure = std::string("reading experts ahead failed: ") + error.what();
@@ -1099,7 +1106,7 @@ void ExpertStore::Impl::load(uint32_t index, LoadUse loadUse, uint32_t rows, boo
   ExpertStoreStats::Use &use = counters.uses[static_cast<size_t>(loadUse)];
   try {
     if (round == 0) {
-      if (sizes[blocks[index].size].slots < shape.experts) retireAhead();
+      if (liveSlots(index) < shape.experts) retireAhead();
       // A load whose later rounds did not run (its command failed, which ends
       // the engine) left routed experts in slots the slot table names but no
       // repack wrote, which the grouping before this load took as resident.
@@ -1143,7 +1150,7 @@ void ExpertStore::Impl::load(uint32_t index, LoadUse loadUse, uint32_t rows, boo
       for (const uint32_t expert : predictedExperts(rows, routed))
         if (blocks[index + 1].slot[expert] == kNoSlot) experts.push_back(expert);
       planAhead(index + 1, experts, use);
-    } else if (sizes[blocks[index].size].slots < shape.experts) {
+    } else if (liveSlots(index) < shape.experts) {
       retireAhead();
     }
   } catch (const std::exception &error) {
@@ -1168,10 +1175,12 @@ void ExpertStore::Impl::readBlockAhead(uint32_t index, LoadUse use) {
 
 ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, ops::MoeShape shape,
                          ExpertStoreOptions options)
-    : impl_(std::make_shared<Impl>(backend, shape, geometryOf(streamed, shape), std::move(options.readers))) {
+    : impl_(std::make_shared<Impl>(backend, shape, geometryOf(streamed, shape), std::move(options.readers),
+                                   options.aheadReaders)) {
   Impl &impl = *impl_;
   const Geometry &geometry = impl.geometry;
-  if (!options.memoryBytes || !impl.readers) throw std::invalid_argument("invalid expert store");
+  if (!options.memoryBytes || !impl.readers || !options.aheadReaders || options.aheadReaders > impl.readers->readers())
+    throw std::invalid_argument("invalid expert store");
   impl.files = std::move(streamed.sources);
   impl.checks = std::move(streamed.checks);
   for (uint32_t block = 0; block < streamed.blocks.size(); ++block)
@@ -1367,6 +1376,10 @@ void ExpertStore::bind(uint32_t block, ops::BlockMoeWeights &weights) {
   weights.streamBlock = block;
 }
 
+uint32_t ExpertStore::liveSlots(uint32_t block) const {
+  return impl_->liveSlots(block);
+}
+
 void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLoadPart> parts, uint32_t block,
                           const std::function<void()> &beside) const {
   const Impl &impl = *impl_;
@@ -1438,7 +1451,7 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
   // next block's mixing, as many as the next load would otherwise read
   // with the GPU waiting.
   if (impl.longChunk(rows) && block + 1 < impl.blocks.size() && impl.streams(block + 1) &&
-      impl.sizes[impl.blocks[block + 1].size].slots >= shape.experts)
+      impl.liveSlots(block + 1) >= shape.experts)
     graph.host([impl = impl_, block, use] { impl->readBlockAhead(block + 1, use); }, timed,
                metal::HostStepGpu::Idle, startAhead);
 }

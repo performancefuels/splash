@@ -430,6 +430,69 @@ void testHostTelemetryReadsTheTaskAndTheHost() {
   require(reported && reported->physFootprintBytes, "the governor's snapshot did not carry the host telemetry");
 }
 
+void testElasticPoolShrinksBeforeExemptAllocationBreachesHostReserve() {
+  class ElasticStore final : public model::ElasticPool {
+  public:
+    ElasticStore(uint64_t &available, uint64_t floorBytes, uint64_t currentBytes, uint64_t unitBytes)
+        : available_(available), floor_(floorBytes), current_(currentBytes), cap_(currentBytes), unit_(unitBytes) {}
+    [[nodiscard]] model::PoolState state() const override {
+      return {.name = "experts",
+              .floorBytes = floor_,
+              .currentBytes = current_,
+              .capBytes = cap_,
+              .releaseUnitBytes = current_ > floor_ ? unit_ : 0};
+    }
+    uint64_t release(uint64_t bytes) override {
+      uint64_t freed = 0;
+      while (freed < bytes && current_ > floor_) {
+        current_ -= unit_;
+        available_ += unit_;
+        test::metalStatistics().allocatedBytes -= unit_;
+        test::metalStatistics().deviceCurrentAllocatedBytes -= unit_;
+        freed += unit_;
+      }
+      return freed;
+    }
+    metal::AllocationResult grow(const metal::AllocationAdmission &) override { return {}; }
+
+  private:
+    uint64_t &available_;
+    uint64_t floor_;
+    uint64_t current_;
+    uint64_t cap_;
+    uint64_t unit_;
+  };
+
+  test::metalStatistics() = {};
+  allocate(3 * kGiB);
+  uint64_t available = 2560 * kMiB;
+  metal::MetalBackend backend("unused");
+  MemoryGovernor governor(backend, 8 * kGiB, 2 * kGiB, 2 * kGiB, [&] { return hostMemory(available); }, 0);
+  governor.yieldPoolsToHostReserve(true);
+  ElasticStore store(available, kGiB, 3 * kGiB, kGiB);
+  governor.ledger().addPool(store);
+  const ClaimId claim = governor.ledger().open({.cls = ClaimClass::InService, .requestId = 1});
+  {
+    const MemoryGovernor::Scope scope(governor, claim);
+    require(governor.allocationAdmission()(kGiB, [] {}).failure == metal::AllocationFailure::HostPressure,
+            "in-service allocation past host spare margin was not initially refused");
+  }
+  require(governor.free(claim, governor.need(claim)).outcome == FreeOutcome::Met,
+          "in-service host-refused claim was not exempted");
+  require(store.state().currentBytes == 2 * kGiB && available == 3584 * kMiB,
+          "elastic store did not shrink a chunk before exempt allocation breached the 2 GiB host reserve");
+  {
+    const MemoryGovernor::Scope scope(governor, claim);
+    require(static_cast<bool>(governor.allocationAdmission()(kGiB, [&] {
+              allocate(kGiB);
+              available -= kGiB;
+            })),
+            "exempt retry was refused");
+  }
+  require(available >= 2 * kGiB, "exempt allocation breached the 2 GiB host reserve");
+  governor.ledger().close(claim);
+}
+
 } // namespace
 
 int main() {
@@ -443,6 +506,7 @@ int main() {
     testReleasedBytesPayOnlyForTheirScope();
     testReleasedBytesPayPastTheLimitAndTheHeldRoom();
     testHostTelemetryReadsTheTaskAndTheHost();
+    testElasticPoolShrinksBeforeExemptAllocationBreachesHostReserve();
     std::cout << "memory governor tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

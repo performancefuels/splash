@@ -209,6 +209,12 @@ void addCombine(metal::CommandGraph &graph, const MoeBuffers &buffers, const Moe
             {plan.rows(), shape.hiddenSize / 256, 1});
 }
 
+// The slots a block's experts have now: a streamed block's of its store,
+// which grows and shrinks with the memory the engine leaves it.
+uint32_t effectiveSlots(const BlockMoeWeights &weights) {
+  return weights.stream ? weights.stream->liveSlots(weights.streamBlock) : weights.slots;
+}
+
 // The routed work of a step of a streamed block that does not run around a
 // load (MoE::aroundLoad), over a grouping that is not streamed: one load when
 // the step routes no more experts than the block's slots, else one pass per
@@ -222,9 +228,10 @@ bool addPartialRouted(metal::CommandGraph &graph, const MoeBuffers &buffers, con
   const MoeShape shape = plan.shape();
   const uint32_t rows = plan.rows();
   if (!weights.stream || MoE::aroundLoad(buffers, weights, plan)) return false;
+  const uint32_t slots = effectiveSlots(weights);
   const MoeScratch &scratch = buffers.scratch;
   const MoeGroupParams group = groupParams(plan, false);
-  if (uint64_t{rows} * shape.expertsPerToken <= weights.slots) {
+  if (uint64_t{rows} * shape.expertsPerToken <= slots) {
     const MoeLoadPart part{&buffers, &plan};
     weights.stream->addLoad(graph, {&part, 1}, weights.streamBlock);
     addGather(graph, buffers, plan);
@@ -242,9 +249,9 @@ bool addPartialRouted(metal::CommandGraph &graph, const MoeBuffers &buffers, con
     std::vector<uint16_t> savedOutput;
   };
   auto state = std::make_shared<MultiPassState>();
-  const uint32_t passes = (shape.experts + weights.slots - 1) / weights.slots;
+  const uint32_t passes = (shape.experts + slots - 1) / slots;
   const uint32_t subRows =
-      std::min(rows, std::max<uint32_t>(1, (weights.slots + shape.expertsPerToken - 1) / shape.expertsPerToken));
+      std::min(rows, std::max<uint32_t>(1, (slots + shape.expertsPerToken - 1) / shape.expertsPerToken));
   const MoePlan subPlan = MoE::plan(shape, subRows, plan.configuration());
   // A tile count of `tiles` tiles, all of which the passes over every tile run.
   const auto countOf = [group](uint32_t tiles) {
@@ -266,7 +273,7 @@ bool addPartialRouted(metal::CommandGraph &graph, const MoeBuffers &buffers, con
                 scratch.expertOutput.contents(), size_t{state.prevRows} * shape.hiddenSize * sizeof(uint16_t));
   };
   for (uint32_t p = 0; p < passes; ++p) {
-    graph.host([state, scratch, shape, countOf, saveOutput, slots = weights.slots, p, passes] {
+    graph.host([state, scratch, shape, countOf, saveOutput, slots, p, passes] {
       auto *tileCount = static_cast<MoeTileCount *>(scratch.tileCount.contents());
       auto *tilesPtr = static_cast<MoeTileDescriptor *>(scratch.tileDescriptors.contents());
       auto *routesPtr = static_cast<uint32_t *>(scratch.groupedRoutes.contents());
@@ -380,8 +387,8 @@ void MoE::addResident(metal::CommandGraph &graph, const MoeBuffers &buffers,
 bool MoE::aroundLoad(const MoeBuffers &buffers, const BlockMoeWeights &weights, const MoePlan &plan) noexcept {
   if (!weights.stream) return false;
   const MoeShape shape = plan.shape();
-  return weights.slots >= shape.experts ||
-         (buffers.lanes && uint64_t{plan.rows()} * shape.expertsPerToken <= weights.slots);
+  const uint32_t slots = effectiveSlots(weights);
+  return slots >= shape.experts || (buffers.lanes && uint64_t{plan.rows()} * shape.expertsPerToken <= slots);
 }
 
 // A streamed block's passes over the experts its load brought, on the load

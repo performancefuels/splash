@@ -302,6 +302,11 @@ RuntimeBootstrapReport ServingRuntime::requireWarmup(
 
   {
     const KvPool::RunwayHold runway(kvPool);
+    struct WarmupScratchHold final {
+      model::RuntimeModel &model;
+      explicit WarmupScratchHold(model::RuntimeModel &m) noexcept : model(m) { model.setWarmupHold(true); }
+      ~WarmupScratchHold() { model.setWarmupHold(false); }
+    } const prefillHold(modelRuntime);
     model::WarmupStepResult maximumPrefill =
         run(RuntimeBootstrapStage::MaximumPrefill, report.warmup.maximumPrefill,
             [&] {
@@ -517,6 +522,9 @@ std::unique_ptr<ServingRuntime> ServingRuntime::start(
         while (modelPointer->releaseIdleBuffer(true)) {
         }
         static_cast<void>(resourcesPointer->cache().releaseEmptyExtents(true));
+        for (model::ElasticPool *pool : modelPointer->pools())
+          if (pool->state().name == "prefill_scratch")
+            static_cast<void>(pool->release(UINT64_MAX));
         // The last check of the host's reserve before Ready weighs what the
         // engine serves with, not the lanes the optional warmups left idle.
         const auto deadline = AwakeClock::now() + kMemoryReleaseWait;

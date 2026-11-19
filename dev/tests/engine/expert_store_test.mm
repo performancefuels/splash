@@ -1822,8 +1822,8 @@ int streamedCoalescedSmallLayouts(MetalBackend &backend, const MoeShape &shape,
     require(streamed.back().stream != nullptr, "a block in a 9-block store did not stream");
   }
   int failures = 0;
-  const MoePlan plans[] = {MoE::decodePlan(shape, 1, MoeConfig{}), prefillPlan(shape, kMaximumRows)};
-  for (const MoePlan &plan : plans) {
+  const StepPlan plans[] = {decodeStep(shape, 1), prefillStep(shape, kMaximumRows)};
+  for (const StepPlan &plan : plans) {
     for (uint32_t b : {0u, 8u}) {
       Buffers buf;
       freshRows(backend, buf, shape);
@@ -1831,7 +1831,7 @@ int streamedCoalescedSmallLayouts(MetalBackend &backend, const MoeShape &shape,
       const std::vector<uint16_t> got = runWeights(backend, streamed[b], buf, plan);
       if (got != want) {
         printf("  9-block store block %u (%s, %u slots) rows=%u: output differs from resident FAIL\n", b,
-               formatNames(*models[b]).c_str(), streamed[b].slots, plan.rows());
+               formatNames(*models[b]).c_str(), streamed[b].slots, plan.plan.rows());
         ++failures;
       }
     }
@@ -1840,6 +1840,69 @@ int streamedCoalescedSmallLayouts(MetalBackend &backend, const MoeShape &shape,
          "multi-pass prefill bitwise %s\n",
          formatNames(host).c_str(), formatNames(lone).c_str(), streamed[8].slots, shape.experts,
          failures ? "FAIL" : "ok");
+  return failures;
+}
+
+// A >8-block store whose cap holds at least two blocks' experts (`capSlots >=
+// shape.experts`) and whose floor holds fewer (`floorSlots < shape.experts` on
+// the 256- and 512-expert shapes): once shrunk to its floor, decode and a
+// 263-row prefill chunk run over the live slots rather than the cap's and
+// match the resident experts bitwise before and after regrowing to the cap.
+int streamedNineBlockShrinkBelowExperts(MetalBackend &backend, const MoeShape &shape,
+                                        const std::filesystem::path &directory) {
+  const Model m = makeModel(backend, shape, Q40, true);
+  ExpertFile file(m, directory / "nine-shrink.bin");
+  StreamedBlocks blocks;
+  for (int i = 0; i < 9; ++i) blocks.blocks.push_back(file.blocks.blocks[0]);
+  blocks.sources = file.blocks.sources;
+  const uint64_t minimum = ExpertStore::minimumBytes(blocks, shape);
+  const uint64_t fixed = ExpertStore::fixedBytes(blocks, shape);
+  const uint64_t capBytes = std::max(minimum, fixed + 4 * (minimum - fixed));
+  ExpertStore store(backend, blocks, shape,
+                    {.memoryBytes = capBytes,
+                     .floorBytes = minimum,
+                     .readers = readers(),
+                     .elasticChunkBytes = 1,
+                     .aheadReaders = 8});
+  growToCap(store);
+  std::vector<BlockMoeWeights> bound;
+  for (uint32_t b = 0; b < 9; ++b) {
+    bound.push_back(m.weights);
+    store.bind(b, bound.back());
+  }
+  BlockMoeWeights &streamed = bound[0];
+  require(streamed.slots >= shape.experts && streamed.stream && streamed.stream->liveSlots(0) == streamed.slots,
+          "the 9-block shrink fixture's cap is below a block's experts");
+  const uint64_t shrunkBytes = store.releaseToFloor();
+  require(shrunkBytes > 0, "the 9-block shrink fixture had no elastic chunk above its floor");
+  const uint32_t floorLiveSlots = static_cast<uint32_t>(store.stats().slots);
+  int failures = 0;
+  const StepPlan decode = decodeStep(shape, 1);
+  const StepPlan prefill = prefillStep(shape, kMaximumRows);
+  for (const bool regrown : {false, true}) {
+    if (regrown) growToCap(store);
+    for (const StepPlan &plan : {decode, prefill}) {
+      Buffers buf;
+      freshRows(backend, buf, shape);
+      const std::vector<uint16_t> want = runWeights(backend, m.weights, buf, plan);
+      std::vector<uint16_t> got;
+      try {
+        got = runWeights(backend, streamed, buf, plan);
+      } catch (const std::exception &err) {
+        printf("  9-block shrink (regrown=%d, rows=%u): threw %s FAIL\n", int(regrown), plan.plan.rows(),
+               err.what());
+        ++failures;
+        continue;
+      }
+      if (got != want) {
+        printf("  9-block shrink (regrown=%d, rows=%u): output differs from resident FAIL\n", int(regrown),
+               plan.plan.rows());
+        ++failures;
+      }
+    }
+  }
+  printf("streamed experts: 9-block shrink (%u live floor slots vs %u cap slots) bitwise %s\n", floorLiveSlots,
+         streamed.slots, failures ? "FAIL" : "ok");
   return failures;
 }
 
@@ -1875,7 +1938,8 @@ int main(int argc, const char *argv[]) {
                     streamedChunkLimit(backend, shape, directory.path()) +
                     streamedSourceChanges(argv[1], shape, directory.path()) +
                     streamedCoalescedSmallLayouts(backend, shape, directory.path()) +
-                    streamedCoalescedSmallLayouts(backend, shape, directory.path(), true);
+                    streamedCoalescedSmallLayouts(backend, shape, directory.path(), true) +
+                    streamedNineBlockShrinkBelowExperts(backend, shape, directory.path());
       }
       if (failures) {
         std::cerr << "expert_store_test: " << failures << " failures\n";

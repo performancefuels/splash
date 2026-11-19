@@ -420,6 +420,12 @@ constexpr uint32_t prefillTensorCount =
 // The target step tensors' shape of a runtime's prompt commands: its
 // prefill group's chunks of kPrefillRows rows.
 [[nodiscard]] TargetRows prefillTargetRows(const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators);
+// Whether a prefill tensor outlives a release of the arena's scratch
+// (PrefillArena::release): the RoPE frequencies, which decode steps read too.
+[[nodiscard]] constexpr bool persistentPrefillTensor(PrefillTensor tensor) noexcept {
+  return tensor == PrefillTensor::TargetInverseFrequencies || tensor == PrefillTensor::DraftInverseFrequencies;
+}
+
 // Sizes depend on the geometry and the device's operator plans: the
 // prefill-only tensors', beside the target step tensors (prefillTargetRows).
 [[nodiscard]] std::array<uint64_t, prefillTensorCount>
@@ -438,23 +444,34 @@ class PrefillArena final {
 public:
   PrefillArena(metal::MetalBackend &backend, const RuntimeGeometry &geometry,
                 const ops::ExecutionPlans &operators)
-      : bytes_(prefillArenaBytes(geometry, operators)), chunks_(geometry.prefillChunks),
-        base_(backend.allocateBuffer(bytes_, metal::BufferStorage::Shared, "qwen-shared-prefill")),
+      : backend_(backend), bytes_(prefillArenaBytes(geometry, operators)),
+        scratchBytes_(bytes_ - persistentBytes(prefillTensorBytes(geometry, operators))),
+        chunks_(geometry.prefillChunks),
+        frequencies_(backend.allocateBuffer(bytes_ - scratchBytes_, metal::BufferStorage::Shared,
+                                            "qwen-rope-frequencies")),
+        base_(backend.allocateBuffer(scratchBytes_, metal::BufferStorage::Shared, "qwen-shared-prefill")),
         target_(backend, base_, 0, geometry.target, prefillTargetRows(geometry, operators)) {
     const auto sizes = prefillTensorBytes(geometry, operators);
-    uint64_t cursor = TargetArena::bytes(geometry.target, target_.shape());
+    // The scratch holds the target step tensors, then the prompt's own but
+    // the frequencies, which have a buffer of their own.
+    uint64_t freqCursor = 0;
+    uint64_t scratchCursor = TargetArena::bytes(geometry.target, target_.shape());
     for (uint32_t index = 0; index < sizes.size(); ++index) {
+      const PrefillTensor kind = static_cast<PrefillTensor>(index);
+      const bool persistent = persistentPrefillTensor(kind);
+      uint64_t &cursor = persistent ? freqCursor : scratchCursor;
+      const metal::MetalBuffer &backing = persistent ? frequencies_ : base_;
       if (sizes[index]) {
-        tensors_[index] = backend.view(base_, cursor, sizes[index]);
-        if (chunks_ > 1 && prefillGroupTensor(static_cast<PrefillTensor>(index))) {
+        tensors_[index] = backend_.view(backing, cursor, sizes[index]);
+        if (chunks_ > 1 && prefillGroupTensor(kind)) {
           if (geometry.prefillPairs) {
             // A command of one chunk has the tensor, a pair's chunks a half each.
             chunkViews_[index] = {tensors_[index],
-                                  backend.view(base_, cursor + sizes[index] / 2, sizes[index] / 2)};
+                                  backend_.view(backing, cursor + sizes[index] / 2, sizes[index] / 2)};
           } else {
             const uint64_t chunkBytes = sizes[index] / chunks_;
             for (uint32_t chunk = 0; chunk < chunks_; ++chunk)
-              chunkViews_[index].push_back(backend.view(base_, cursor + chunk * chunkBytes, chunkBytes));
+              chunkViews_[index].push_back(backend_.view(backing, cursor + chunk * chunkBytes, chunkBytes));
           }
         }
       }
@@ -468,15 +485,15 @@ public:
       GdnParityBuffers cell;
       cell.stateBase = get(PrefillTensor::GroupCell);
       for (uint32_t layer = 0; layer < layout.layers; ++layer)
-        cell.convolutionLayers.push_back(backend.view(
+        cell.convolutionLayers.push_back(backend_.view(
             cell.stateBase, uint64_t{layer} * layout.convolutionLayerBytes(), layout.convolutionLayerBytes()));
       if (layout.auxiliaryBytes)
-        cell.auxiliary = backend.view(cell.stateBase, layout.convolutionBytes(), layout.auxiliaryBytes);
+        cell.auxiliary = backend_.view(cell.stateBase, layout.convolutionBytes(), layout.auxiliaryBytes);
       groupCell_ = std::move(cell);
     } else if (chunks_ > 1) {
-      groupCell_ = gdnCellBuffers(backend, get(PrefillTensor::GroupCell), geometry.target.stateLayout);
+      groupCell_ = gdnCellBuffers(backend_, get(PrefillTensor::GroupCell), geometry.target.stateLayout);
     }
-    if (cursor != bytes_)
+    if (freqCursor != bytes_ - scratchBytes_ || scratchCursor != scratchBytes_)
       throw std::logic_error("prefill arena mismatch");
     auto *target = static_cast<float *>(
         get(PrefillTensor::TargetInverseFrequencies).contents());
@@ -491,9 +508,7 @@ public:
       draft[dim] = std::pow(geometry.draft.rotaryTheta,
                             -static_cast<float>(dim) / geometry.draftRotaryPairs());
     }
-    // Split projections return their counters to zero; they start there.
-    if (const metal::MetalBuffer counters = get(PrefillTensor::LinearCounters))
-      std::memset(counters.contents(), 0, counters.sizeBytes());
+    zeroCounters();
   }
 
   // Chunk `chunk`'s view of a group's tensor (prefillGroupTensor), or the
@@ -517,15 +532,48 @@ public:
   }
   [[nodiscard]] const TargetArena &target() const noexcept { return target_; }
   [[nodiscard]] uint64_t bytes() const noexcept { return bytes_; }
+  [[nodiscard]] uint64_t allocatedBytes() const noexcept {
+    return frequencies_.allocatedBytes() + base_.allocatedBytes();
+  }
+  [[nodiscard]] uint64_t scratchBytes() const noexcept { return scratchBytes_; }
+  [[nodiscard]] bool released() const noexcept { return released_; }
+  void release() {
+    if (released_ || !base_) return;
+    backend_.releaseMemory(base_);
+    released_ = true;
+  }
+  void restore() {
+    if (!released_ || !base_) return;
+    backend_.restoreMemory(base_);
+    zeroCounters();
+    released_ = false;
+  }
 
 private:
+  // The bytes of the tensors that outlive a release (persistentPrefillTensor).
+  [[nodiscard]] static uint64_t persistentBytes(const std::array<uint64_t, prefillTensorCount> &sizes) noexcept {
+    uint64_t bytes = 0;
+    for (uint32_t index = 0; index < sizes.size(); ++index)
+      if (persistentPrefillTensor(static_cast<PrefillTensor>(index))) bytes += alignUp(sizes[index]);
+    return bytes;
+  }
+  void zeroCounters() {
+    // Split projections return their counters to zero; they start there.
+    if (const metal::MetalBuffer counters = get(PrefillTensor::LinearCounters))
+      std::memset(counters.contents(), 0, counters.sizeBytes());
+  }
+
+  metal::MetalBackend &backend_;
   uint64_t bytes_ = 0;
+  uint64_t scratchBytes_ = 0;
   uint32_t chunks_ = 1;
+  metal::MetalBuffer frequencies_;
   metal::MetalBuffer base_;
   TargetArena target_;
   std::array<metal::MetalBuffer, prefillTensorCount> tensors_{};
   std::array<std::vector<metal::MetalBuffer>, prefillTensorCount> chunkViews_{};
   std::optional<GdnParityBuffers> groupCell_;
+  bool released_ = false;
 };
 
 // A decode step's own tensors, beside the target step tensors of its lanes'

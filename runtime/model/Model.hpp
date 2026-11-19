@@ -894,6 +894,14 @@ public:
   // need.pages pages, which holds Index pages, the request's while its
   // prompt goes on, also once refused (model::KvHistoryStream::reserve).
   [[nodiscard]] virtual ModelMemoryAdmission reserveSpilledReads(uint64_t, SpilledReadNeed) { return {.ok = true}; }
+  // The bytes the shared prefill scratch (PrefillArena and any target prefill
+  // scratch) would allocate now (reservePrefillScratch): zero while live or by
+  // default.
+  [[nodiscard]] virtual uint64_t prefillScratchShortfall() const { return 0; }
+  // Restores the shared prefill scratch once for `requestId`'s prompt if it was
+  // released, keeping it while any prompt it was reserved for stays resident
+  // and incomplete.
+  [[nodiscard]] virtual ModelMemoryAdmission reservePrefillScratch(uint64_t) { return {.ok = true}; }
   // Whether the disk tier takes a state written from a lane now, for a
   // state in use or not, as CompositeState::canOffload. Room in the quota is
   // the write's own concern.
@@ -979,6 +987,7 @@ public:
   ~RuntimeModel() override = default;
 
   // Actual rows, not padded dispatch rows; valid range is 1..prefillTokenBudget.
+  virtual void setWarmupHold(bool) noexcept {}
   virtual WarmupStepResult warmupPrefill(uint32_t rows) = 0;
   virtual WarmupStepResult warmupDecodeBatch(uint32_t width) = 0;
   virtual WarmupStepResult warmupCompositeStateRestore() = 0;

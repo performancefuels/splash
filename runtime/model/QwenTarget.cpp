@@ -76,6 +76,10 @@ QwenTarget::QwenTarget(const QwenTargetWeightsBase &weights, const QwenTargetGeo
 QwenTarget::~QwenTarget() = default;
 
 QwenTargetScratchBytes QwenTarget::allocatedScratchBytes() const noexcept { return {}; }
+uint64_t QwenTarget::prefillScratchBytes() const noexcept { return 0; }
+bool QwenTarget::prefillScratchReleased() const noexcept { return false; }
+void QwenTarget::releasePrefillScratch() {}
+void QwenTarget::restorePrefillScratch() {}
 
 const ops::Projection &QwenTarget::vocabularyProjection() const noexcept {
   return weightsBase_.logitsProjection;
