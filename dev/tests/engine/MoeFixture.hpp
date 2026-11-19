@@ -131,21 +131,14 @@ inline gguf_reference::Fmt fitting(size_t i, uint32_t K) {
   throw std::logic_error("no format fits the row");
 }
 
-// The model of `shape` and format f: gate, up and down in f and the next two
-// formats, cyclically, and the shared expert's in the three after them, each
-// the next that fits its rows; with upInGateFormats, up in the gate's
-// formats.
-inline Model makeModel(splash::metal::MetalBackend &backend, const splash::ops::MoeShape &shape, int f,
-                       bool upInGateFormats) {
+// A model with the six projections in explicitly chosen formats.
+inline Model makeModel(splash::metal::MetalBackend &backend, const splash::ops::MoeShape &shape,
+                       const std::array<gguf_reference::Fmt, 6> &formats) {
   const uint32_t hidden = shape.hiddenSize, intermediate = shape.expertIntermediateSize;
   const uint32_t n[3] = {intermediate, intermediate, hidden}, k[3] = {hidden, hidden, intermediate};
   Model m;
   m.shape = shape;
-  for (size_t i = 0; i < m.formats.size(); ++i) m.formats[i] = fitting(f + i, k[i % 3]);
-  if (upInGateFormats) {
-    m.formats[1] = m.formats[0];
-    m.formats[4] = m.formats[3];
-  }
+  m.formats = formats;
   m.router = floating(backend, shape.experts, hidden, 0.05f);
   if (shape.sharedGate) m.sharedGate = floating(backend, 1, hidden, 0.05f);
   for (int p = 0; p < 3; ++p) {
@@ -163,6 +156,20 @@ inline Model makeModel(splash::metal::MetalBackend &backend, const splash::ops::
   gguf.chunks = splash::ops::residentExpertChunks(gguf);
   m.weights = gguf;
   return m;
+}
+
+// Gate, up and down in f and the next two fitting formats, cyclically,
+// with the shared expert in the three after them. Optionally pair up with gate.
+inline Model makeModel(splash::metal::MetalBackend &backend, const splash::ops::MoeShape &shape, int f,
+                       bool upInGateFormats) {
+  const uint32_t k[3] = {shape.hiddenSize, shape.hiddenSize, shape.expertIntermediateSize};
+  std::array<gguf_reference::Fmt, 6> formats;
+  for (size_t i = 0; i < formats.size(); ++i) formats[i] = fitting(f + i, k[i % 3]);
+  if (upInGateFormats) {
+    formats[1] = formats[0];
+    formats[4] = formats[3];
+  }
+  return makeModel(backend, shape, formats);
 }
 
 // The weights of `m` with its routed experts copied into a floor chunk of

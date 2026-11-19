@@ -51,6 +51,7 @@ struct ModelLoadOptions final {
   uint64_t expertFloorBytes = 0;
   double expertFloorShare = kExpertFloorShare;
   std::shared_ptr<SsdReaders> readers;
+  bool releaseVisionWeights = false;
 };
 
 struct LoadedModel final {

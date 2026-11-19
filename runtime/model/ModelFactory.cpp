@@ -141,10 +141,20 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   // Every source's metadata is checked before the first image is written:
   // the vision tower's and the draft's here, the target's by its loader.
   const auto vision = planVisionLoader(root, result.descriptor);
+  const bool onDemandVision = options.releaseVisionWeights && options.expertMemoryBytes > 0 && vision != nullptr;
+  if (onDemandVision) {
+    auto visionImages = std::make_shared<WeightImages>(backend, result.descriptor.sourceIdentity);
+    result.vision = loadVisionWeights(backend, *visionImages, vision.get());
+    visionImages->release();
+    result.vision.images = std::move(visionImages);
+    result.vision.actualAllocatedBytes = 0;
+    backend.restartPeaks();
+  }
   DraftCheckpointLoader draft(backend, images, root / "draft", result.descriptor.draft);
   result.target = loadTarget(backend, images, root, result.descriptor, options);
   result.draft = loadDFlashDraftWeights(backend, draft, result.descriptor.draft);
-  result.vision = loadVisionWeights(backend, images, vision.get());
+  if (!onDemandVision)
+    result.vision = loadVisionWeights(backend, images, vision.get());
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),
                                         result.targetFiles().end());

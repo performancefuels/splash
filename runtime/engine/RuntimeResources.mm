@@ -485,7 +485,7 @@ std::array<uint8_t, 32> parseSha256(std::string_view value) {
 void requireLoadedModel(const model::LoadedModel &loaded) {
   if (!loaded.targetActualAllocatedBytes() ||
       !loaded.draft.actualAllocatedBytes ||
-      (loaded.descriptor.hasVision() && !loaded.vision.actualAllocatedBytes) ||
+      (loaded.descriptor.hasVision() && !loaded.vision.actualAllocatedBytes && !loaded.vision.plannedAllocatedBytes) ||
       loaded.manifestFingerprintSha256.empty() ||
       loaded.targetManifestFingerprint().empty()) {
     throw std::invalid_argument(
@@ -865,7 +865,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                                    .expertMemoryBytes = plan.expertBytes,
                                    .expertFloorBytes = plan.expertFloorBytes,
                                    .expertFloorShare = plan.expertFloorShare,
-                                   .readers = readers};
+                                   .readers = readers,
+                                   .releaseVisionWeights = plan.expertBytes != 0};
   };
   model::ModelLoadOptions loadOptions;
   try {
@@ -994,7 +995,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     ModelMemoryFootprint footprint{
         loaded.targetActualAllocatedBytes(),
         loaded.draft.actualAllocatedBytes,
-        loaded.vision.actualAllocatedBytes,
+        loaded.vision.images ? (loaded.vision.images->released() ? 0 : loaded.vision.plannedAllocatedBytes)
+                             : loaded.vision.actualAllocatedBytes,
         streamed.plan && streamed.plan->spill.enabled ? spillModelMemoryPlan : modelMemoryPlan,
         stagingBytes,
         aneFfnBytes,
@@ -1467,7 +1469,9 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   ActualMemoryReport report;
   report.targetWeightsBytes = model_.targetActualAllocatedBytes();
   report.draftWeightsBytes = model_.draft.actualAllocatedBytes;
-  report.visionWeightsBytes = model_.vision.actualAllocatedBytes;
+  report.visionWeightsBytes = model_.vision.images
+                                  ? (model_.vision.images->released() ? 0 : model_.vision.plannedAllocatedBytes)
+                                  : model_.vision.actualAllocatedBytes;
   report.stateAllocatedBytes = modelMemory.stateActualAllocatedBytes;
   report.sharedPrefillBytes = modelMemory.sharedPrefillActualAllocatedBytes;
   report.sharedDecodeBytes = modelMemory.sharedDecodeActualAllocatedBytes;

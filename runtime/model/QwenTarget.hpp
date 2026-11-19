@@ -632,7 +632,14 @@ protected:
       if (steps.front().attentionLayer != attentionLayer)
         steps.front().spilled.layerEnd(steps.front().graph, attentionLayer);
       const ops::BlockMoeWeights *ffn = layers.moe(index);
-      const bool streams = ffn && ffn->stream;
+      // The steps run around the one load where each of them does
+      // (ops::MoE::aroundLoad): those of a block whose slots hold its experts,
+      // and a decode step, its command's only one, that routes no more
+      // experts than the slots hold. Any other step loads its experts in its
+      // routed work (ops::MoE::addRouted).
+      const bool streams = ffn && ffn->stream && std::ranges::all_of(steps, [&](const Step &step) {
+        return ops::MoE::aroundLoad(step.ffn, *ffn, *step.moe);
+      });
       if (streams)
         ffn->stream->addLoad(steps.front().graph, parts, ffn->streamBlock, [&] {
           ops::MoE::addResident(steps.front().graph, steps.front().ffn, *ffn, *steps.front().moe);

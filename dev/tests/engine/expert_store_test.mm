@@ -1779,6 +1779,70 @@ int streamedSourceChanges(const std::string &metallibPath, const MoeShape &shape
   return 0;
 }
 
+// Small layouts stream below one block's capacity. Separate runs cover an
+// incompatible singleton floor and equal-plane Q4_0/IQ4_NL layouts sharing
+// a slot budget while retaining each block's decoder. Both must match the
+// resident experts bitwise through decode and long multi-pass prefill.
+int streamedCoalescedSmallLayouts(MetalBackend &backend, const MoeShape &shape,
+                                  const std::filesystem::path &directory, bool equalPlanes = false) {
+  const auto model = [&](Fmt format) {
+    if (!equalPlanes) return makeModel(backend, shape, format, true);
+    std::array<Fmt, 6> formats;
+    formats.fill(format);
+    return makeModel(backend, shape, formats);
+  };
+  const Model host = model(equalPlanes ? Q40 : IQ3XXS);
+  const Model lone = model(equalPlanes ? IQ4NL : IQ1S);
+  ExpertFile fHost(host, directory / "coal-host.bin");
+  ExpertFile fLone(lone, directory / "coal-lone.bin");
+  StreamedBlocks blocks;
+  // Eight host-format blocks and one singleton: a multi-layer store.
+  for (int i = 0; i < 8; ++i) blocks.blocks.push_back(fHost.blocks.blocks[0]);
+  blocks.blocks.push_back(fLone.blocks.blocks[0]);
+  blocks.sources = std::make_shared<std::pair<std::shared_ptr<const void>, std::shared_ptr<const void>>>(
+      fHost.blocks.sources, fLone.blocks.sources);
+  // The singleton streams rather than pinning all its experts. Compatible
+  // layouts use no more minimum memory than nine blocks of the host format.
+  const uint64_t minimum = ExpertStore::minimumBytes(blocks, shape);
+  if (equalPlanes) {
+    StreamedBlocks same = blocks;
+    same.blocks.back() = same.blocks.front();
+    require(minimum == ExpertStore::minimumBytes(same, shape),
+            "equal-plane formats required an additional expert-store floor");
+  }
+  ExpertStore store(backend, blocks, shape, {.memoryBytes = minimum, .readers = readers()});
+  growToCap(store);
+  const ExpertStoreStats initial = store.stats();
+  require(initial.resident == 0, "a 9-block store pinned a singleton block at startup");
+  const Model *models[9] = {&host, &host, &host, &host, &host, &host, &host, &host, &lone};
+  std::vector<BlockMoeWeights> streamed;
+  for (uint32_t b = 0; b < 9; ++b) {
+    streamed.push_back(models[b]->weights);
+    store.bind(b, streamed.back());
+    require(streamed.back().stream != nullptr, "a block in a 9-block store did not stream");
+  }
+  int failures = 0;
+  const MoePlan plans[] = {MoE::decodePlan(shape, 1, MoeConfig{}), prefillPlan(shape, kMaximumRows)};
+  for (const MoePlan &plan : plans) {
+    for (uint32_t b : {0u, 8u}) {
+      Buffers buf;
+      freshRows(backend, buf, shape);
+      const std::vector<uint16_t> want = runWeights(backend, models[b]->weights, buf, plan);
+      const std::vector<uint16_t> got = runWeights(backend, streamed[b], buf, plan);
+      if (got != want) {
+        printf("  9-block store block %u (%s, %u slots) rows=%u: output differs from resident FAIL\n", b,
+               formatNames(*models[b]).c_str(), streamed[b].slots, plan.rows());
+        ++failures;
+      }
+    }
+  }
+  printf("streamed experts: 9 blocks (%s + %s, %u/%u singleton slots), decode + 263-row "
+         "multi-pass prefill bitwise %s\n",
+         formatNames(host).c_str(), formatNames(lone).c_str(), streamed[8].slots, shape.experts,
+         failures ? "FAIL" : "ok");
+  return failures;
+}
+
 } // namespace
 
 int main(int argc, const char *argv[]) {
@@ -1809,7 +1873,9 @@ int main(int argc, const char *argv[]) {
                     streamedStartsAtItsFloor(backend, shape, directory.path()) +
                     streamedSkippedLoadAfterShrink(argv[1], shape, directory.path()) +
                     streamedChunkLimit(backend, shape, directory.path()) +
-                    streamedSourceChanges(argv[1], shape, directory.path());
+                    streamedSourceChanges(argv[1], shape, directory.path()) +
+                    streamedCoalescedSmallLayouts(backend, shape, directory.path()) +
+                    streamedCoalescedSmallLayouts(backend, shape, directory.path(), true);
       }
       if (failures) {
         std::cerr << "expert_store_test: " << failures << " failures\n";

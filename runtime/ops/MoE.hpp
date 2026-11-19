@@ -160,6 +160,12 @@ public:
   // slots of routed segments of gate's, up's and down's formats and sizes.
   [[nodiscard]] bool checkedFor(uint32_t slots, const QuantizedSegment &gate, const QuantizedSegment &up,
                                 const QuantizedSegment &down) const noexcept;
+  [[nodiscard]] ExpertChunks forBlock(const QuantizedSegment &gate, const QuantizedSegment &up,
+                                      const QuantizedSegment &down) const noexcept {
+    ExpertChunks copy = *this;
+    copy.routed_ = {routedOf(gate), routedOf(up), routedOf(down)};
+    return copy;
+  }
 
 private:
   // A routed segment's format and size, which a check of the views reads.
@@ -406,13 +412,23 @@ struct MoE final {
   // chunks, QwenTarget::addPrefillLayers) run their routings, one load of
   // the union beside the first step's resident work, then each step's work
   // through its combine before the next step's: they share the scratch their
-  // gathers and passes write, all but their routing.
+  // gathers and passes write, all but their routing. A step of a streamed
+  // block that does not run around a load (aroundLoad) groups its routes as a
+  // resident block's and loads its experts in addRouted, a range of the
+  // block's slots a pass, with no addResident.
   static void addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
                          const BlockMoeWeights &weights, const MoePlan &plan);
   static void addResident(metal::CommandGraph &graph, const MoeBuffers &buffers,
                           const BlockMoeWeights &weights, const MoePlan &plan);
   static void addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
                         const BlockMoeWeights &weights, const MoePlan &plan);
+  // Whether a streamed block's step runs around one load of the experts it
+  // routes: a block whose slots hold every expert, or a decode step (its
+  // command's only step, MoeBuffers::lanes) that routes no more experts than
+  // the slots hold. An expert store's floors leave a block fewer slots than
+  // experts on models of more than 8 streamed blocks (model::ExpertStore).
+  [[nodiscard]] static bool aroundLoad(const MoeBuffers &buffers, const BlockMoeWeights &weights,
+                                       const MoePlan &plan) noexcept;
   // The routing of `rows` rows of `input` by a block's `router` and
   // `sharedScalarGate` (unread without shape.sharedGate): the router's fp32
   // scores in `scores` (rows of shape.routerWidth()), then each row's top-k

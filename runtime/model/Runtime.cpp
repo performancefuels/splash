@@ -43,6 +43,7 @@
 #include <list>
 #include <numeric>
 #include <optional>
+#include <semaphore>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -119,10 +120,16 @@ public:
 
   // A command submitted once `encodes`, the command of the image encodes
   // ahead of it, has completed (Runtime::prefillAsync).
-  DeferredMetalTicket(CommandTicket encodes, Submission submit, Completion completion, WorkCount count)
+  DeferredMetalTicket(CommandTicket encodes, Submission submit, Completion completion, WorkCount count,
+                      std::function<void()> cleanup = {})
       : count_(std::move(count)), completion_(std::move(completion)), submit_(std::move(submit)),
-        ticket_(std::move(encodes)) {}
+        cleanup_(std::move(cleanup)), ticket_(std::move(encodes)) {}
 
+  ~DeferredMetalTicket() override {
+    ticket_ = CommandTicket{};
+    if (cleanup_)
+      cleanup_();
+  }
   void advance() override {
     if (submit_ && ticket_.ready())
       submitAfterEncodes();
@@ -181,6 +188,7 @@ private:
   Completion completion_;
   // The command's submission, while the ticket is its encodes'.
   Submission submit_;
+  std::function<void()> cleanup_;
   CommandTicket ticket_;
   CommandTiming encodes_;
   double wallMilliseconds_ = 0.0;
@@ -628,6 +636,7 @@ struct Runtime::Impl {
       if (!bytes || !releasable()) return 0;
       const uint64_t arena = runtime_.vision->arenaBytes();
       runtime_.vision.reset();
+      runtime_.releaseLeftVision();
       return arena;
     }
     metal::AllocationResult grow(const metal::AllocationAdmission &) override { return {}; }
@@ -966,6 +975,7 @@ struct Runtime::Impl {
         retain(image.rows);
     }
     entry.images.clear();
+    releaseLeftVision();
   }
 
   // Whether the request has begun and holds its lane.
@@ -1017,6 +1027,13 @@ struct Runtime::Impl {
       static_cast<void>(releaseStaging());
   }
 
+  // A cancelled/suspended prompt may never reach its late image. Release
+  // its admitted tower at the next safe point once no image needs an encode.
+  void releaseLeftVision() {
+    if (model.vision.images && !model.vision.images->released() && visionIdle() && !backend.commandInFlight())
+      model.vision.images->release();
+  }
+
   // Puts back the encoder a start replaced, or drops the one it built,
   // unless the start completes: an admission granted it, but a later step of
   // the start threw.
@@ -1024,11 +1041,32 @@ struct Runtime::Impl {
     Impl &runtime;
     std::shared_ptr<ops::Vision> previous;
     bool committed = false;
+    bool releasedWeights = runtime.model.vision.images && runtime.model.vision.images->released();
     ~VisionRollback() {
-      if (!committed)
+      if (!committed) {
         runtime.vision = std::move(previous);
+        if (releasedWeights) runtime.model.vision.images->release();
+      }
     }
   };
+
+  // The CPU-only projector writer completes inside the image activation's
+  // governed allocation transaction. WeightImages restores one image at a
+  // time asynchronously; the next restore must not race that writer.
+  void restoreVisionWeights() {
+    WeightImages &images = *model.vision.images;
+    std::binary_semaphore written{0};
+    images.setCompletionNotifier([&written] { written.release(); });
+    try {
+      while (images.released())
+        if (!images.restore(metal::admittedWithin)) written.acquire();
+    } catch (...) {
+      images.release();
+      images.setCompletionNotifier({});
+      throw;
+    }
+    images.setCompletionNotifier({});
+  }
 
   // What a refused start matched (StateAdmission::held): the rows it would
   // share and, when an image still needs its encode and the live encoder
@@ -1092,9 +1130,13 @@ struct Runtime::Impl {
         encodePatches && !(vision && vision->maximumPatches() >= encodePatches)
             ? ops::Vision::scratchBytes(model.vision.tensors.layout, encodePatches)
             : 0;
+    const uint64_t weightsBytes = encodePatches && model.vision.images && model.vision.images->released()
+                                      ? model.vision.plannedAllocatedBytes
+                                      : 0;
     std::shared_ptr<ops::Vision> encoder;
     const uint8_t *pixels = request.imagePixels.data();
     const auto allocate = [&] {
+      if (weightsBytes) restoreVisionWeights();
       if (encoderBytes) {
         encoder = std::make_shared<ops::Vision>(backend, model.vision.tensors, encodePatches);
       }
@@ -1112,8 +1154,9 @@ struct Runtime::Impl {
         pixels += span.pixelBytes();
       }
     };
+    VisionRollback rollback{*this, vision};
     StateAdmission admission = laneAdmission(
-        stateLane, states.tryActivateLane(stateLane, request.id, encoderBytes + bytes, allocate));
+        stateLane, states.tryActivateLane(stateLane, request.id, encoderBytes + bytes + weightsBytes, allocate));
     if (!admission.granted()) {
       admission.held = std::make_shared<const Matched>(
           Matched{std::move(shared), encodePatches && !encoderBytes ? vision : nullptr});
@@ -1123,6 +1166,7 @@ struct Runtime::Impl {
       vision = std::move(encoder);
     counters.imageEmbeddingReuses += shared.size();
     images = std::move(staged);
+    rollback.committed = true;
     return admission;
   }
 
@@ -3565,6 +3609,7 @@ Runtime::submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
                 std::function<void()> completion) {
   // The staging of a request that left while another command ran.
   impl_->releaseLeftStaging();
+  impl_->releaseLeftVision();
   switch (plan.kind) {
   case WorkKind::Prefill:
     return prefillAsync(plan, items, std::move(completion));
@@ -3814,6 +3859,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
         if (image.rows && image.rows->encoding)
           image.rows->encoding = false;
     }
+    impl->releaseLeftVision();
     impl->counters.lastPrefillWallSeconds = timing.wallSeconds;
     impl->counters.totalPrefillWallSeconds += timing.wallSeconds;
     impl->counters.lastPrefillGpuSeconds = timing.gpuSeconds;
@@ -3845,7 +3891,8 @@ Runtime::prefillAsync(const BatchPlan &plan,
     // the command is submitted, whatever work runs ahead of it
     // (MetalBackend.hpp, EventStep).
     ticket = std::make_unique<DeferredMetalTicket>(impl_->backend.submitCommandAsync(encodes.command(), completion),
-                                                   submit, std::move(finish), std::move(count));
+                                                   submit, std::move(finish), std::move(count),
+                                                   [impl] { impl->releaseLeftVision(); });
   }
   // While the GPU runs it, each lane's lookup index takes its chunk's tokens.
   for (uint32_t lane = 0; lane < items.size(); ++lane)

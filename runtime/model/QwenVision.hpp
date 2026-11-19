@@ -18,7 +18,9 @@ class VisionLoader;
 struct QwenVisionWeights final {
   ops::VisionWeights tensors;
   std::vector<WeightFileRecord> files;
+  std::shared_ptr<WeightImages> images;
   uint64_t actualAllocatedBytes = 0;
+  uint64_t plannedAllocatedBytes = 0;
 };
 
 // The tower's image, written from an upstream source.

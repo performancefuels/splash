@@ -158,7 +158,9 @@ constexpr uint64_t kBytesArgumentLimit = 4096;
 constexpr auto kTicketWaitSlice = std::chrono::seconds(1);
 // The queue's outstanding command buffers; a command takes one, and one more
 // per buffer its event steps add (addedBuffers).
-constexpr NSUInteger kMaximumCommandBuffers = 512;
+// Four-lane streamed MoE verification with beside-host overlap can exceed
+// 512 buffers. Keep a finite bound without enlarging the expert staging.
+constexpr NSUInteger kMaximumCommandBuffers = 1024;
 // The most loads host_step_wait spins for through an awake step: 60-190 ms on
 // the M5 Max (0.23-0.71 us a load), longer than nearly every step's work.
 // The spin check bounds its spins by their release (hostStepCheckLoads).

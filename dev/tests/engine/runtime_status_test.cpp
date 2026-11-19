@@ -760,8 +760,8 @@ void testStreamedExpertsStatus() {
   require(status(experts).find(
               "\"streamed_experts\":{\"cap_bytes\":18602770432,\"floor_bytes\":15837691904,\"chunks\":3,"
               "\"cap_chunks\":4,\"shrinks\":2,\"regrows\":1,\"arena_bytes\":17179869184,"
-              "\"staging_bytes\":452984832,\"slots\":8192,"
-              "\"experts\":25088,\"resident\":8000,\"prefill\":{\"loads\":0,\"routed\":0,\"read\":0,\"prefetched\":0,"
+              "\"staging_bytes\":452984832,\"slots\":8192,\"experts\":25088,\"resident\":8000,"
+              "\"prefill\":{\"loads\":0,\"routed\":0,\"read\":0,\"prefetched\":0,"
               "\"read_ahead\":0,\"hit_rate\":0,\"read_bytes\":0,\"host_steps\":{\"pickup_ms\":" +
               none + ",\"work_ms\":" + none + ",\"resume_ms\":" + none +
               "}},"

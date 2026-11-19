@@ -71,6 +71,7 @@ QwenVisionWeights readVision(metal::MetalBackend &backend, WeightImages &images,
 
   result.actualAllocatedBytes = metal::allocationDelta(
       allocationBaseline, backend.memoryStats().allocatedBytes);
+  result.plannedAllocatedBytes = result.actualAllocatedBytes;
   return result;
 }
 
