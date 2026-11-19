@@ -140,13 +140,17 @@ template <> struct ValueRun<bfloat> {
 // group of sixteen runs as two parts of 64 fused rows, eight simdgroups each.
 // HeadDim 128 (Flint's layouts) halves the QK blocks and O^T tiles; Window, as
 // the MPP tile's, attends a row at position p only the keys p - Window to p.
+// A tree's tile (SplashAttentionTree) masks each row as the MPP tile's page
+// softmax does: of the rows of its block, from the anchor on, to those its
+// ancestors hold, its window that of its position, the anchor's plus its
+// depth, and its pages from the anchor's window.
 template <uint KVHeads, uint QueryHeadsPerKVHead, typename CacheElement, uint Rows = 8,
           uint HeadDim = SPLASH_KV_HEAD_DIMENSION, uint Window = 0>
 __attribute__((always_inline)) inline void tile(
     device const bfloat *tile_queries, device const SplashKvPage *page_table,
     SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
     uint split, device float *partials, device float *statistics, ulong slot,
-    uint sg, uint lane, threadgroup uint *query_stage) {
+    SplashAttentionTree tree, uint sg, uint lane, threadgroup uint *query_stage) {
   constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
   constexpr uint G = QueryHeadsPerKVHead;
   constexpr uint M = Rows * G;
@@ -154,12 +158,13 @@ __attribute__((always_inline)) inline void tile(
   constexpr uint D = HeadDim;
   static_assert(N == 32 && (D == 256 || D == 128),
                 "fragment maps assume Page32 and D of 256 or 128");
-  static_assert(SPLASH_TARGET_VERIFY_ROWS == 8 && SPLASH_PREFILL_ATTENTION_TILE_ROWS == 8 &&
-                    8 % Rows == 0 && M % 8 == 0,
+  static_assert(SPLASH_ATTENTION_TILE_ROWS == 8 && 8 % Rows == 0 && M % 8 == 0,
                 "one simdgroup per eight fused rows of an eight-row tile or one of its parts");
+  const bool in_tree = tree.rows != nullptr;
   const uint visible = committed_tokens + active_rows;
   const uint pages = splash_attention_pages(visible);
-  const uint first_page = splash_attention_first_page<Window>(committed_tokens);
+  const uint first_page = splash_attention_first_page<Window>(
+      splash_attention_window_position(in_tree, tree.anchor, committed_tokens));
   const uint per_split = splash_attention_pages_per_split(pages - first_page, splits);
   const uint page_begin = first_page + split * per_split;
   if (page_begin >= pages)
@@ -169,12 +174,22 @@ __attribute__((always_inline)) inline void tile(
   const uint fm = l.fm, fn = l.fn;
   // This lane's fused rows are row and row + 1, the columns of its fragments.
   const uint row = sg * 8 + fn;
+  const uint2 tile_row(min(row / G, active_rows - 1), min((row + 1) / G, active_rows - 1));
   const uint2 limit(
-      min(visible, committed_tokens + min(row / G, active_rows - 1) + 1),
-      min(visible, committed_tokens + min((row + 1) / G, active_rows - 1) + 1));
-  // A row's first key with a window: its causal end less Window keys.
-  const uint2 window_start(splash_attention_window_start<Window>(limit.x - 1),
-                           splash_attention_window_start<Window>(limit.y - 1));
+      min(visible, committed_tokens + tile_row.x + 1),
+      min(visible, committed_tokens + tile_row.y + 1));
+  // A row's first key with a window: its position's less Window keys, its
+  // position its causal end's, or for a tree's row the anchor's plus its
+  // depth. A tree's row sees, of its block's rows, its ancestors'.
+  uint2 position = limit - 1u;
+  uint2 ancestors(0u);
+  if (in_tree) {
+    const SplashTreeRow first = tree.rows[tile_row.x], second = tree.rows[tile_row.y];
+    position = tree.anchor + uint2(uint(first.depth), uint(second.depth));
+    ancestors = uint2(first.ancestors, second.ancestors);
+  }
+  const uint2 window_start(splash_attention_window_start<Window>(position.x),
+                           splash_attention_window_start<Window>(position.y));
 
   // Q^T fragments for all D/4 QK steps, bfloat pairs (row, row + 1), staged
   // in this lane's own threadgroup words (step-major, so lanes never share a
@@ -243,16 +258,27 @@ __attribute__((always_inline)) inline void tile(
     // 1/sqrt(D): 0.0625 = 2^-4 (D of 256); 0.08838834764831845 = 2^-3.5 (128).
     constexpr float kScoreScale = D == 256 ? 0.0625f : 0.08838834764831845f;
     const uint token_start = page * N;
+    // Whether each of this lane's rows sees the token of S^T tile s: within
+    // its causal end and its window and, in a page that holds rows of a
+    // tree's block, not one of them off the row's path.
+    const bool block_page = in_tree && token_start + N > tree.anchor;
+    bool2 seen[4];
     float2 local_max(-INFINITY);
 #pragma unroll
     for (uint s = 0; s < 4; ++s) {
       const uint token = token_start + page_token(fm, s);
+      bool2 on_path(true);
+      if (block_page && token >= tree.anchor) {
+        const uint block_row = min(token - tree.anchor, 31u);
+        on_path = bool2(((ancestors.x >> block_row) & 1u) != 0u, ((ancestors.y >> block_row) & 1u) != 0u);
+      }
+      seen[s] = bool2(token < limit.x && token >= window_start.x && on_path.x,
+                      token < limit.y && token >= window_start.y && on_path.y);
       float2 score = scores[s];
       if constexpr (Quantized)
         score *= key_scale[s];
       score *= kScoreScale;
-      scores[s] = float2(token < limit.x && token >= window_start.x ? score.x : -INFINITY,
-                         token < limit.y && token >= window_start.y ? score.y : -INFINITY);
+      scores[s] = float2(seen[s].x ? score.x : -INFINITY, seen[s].y ? score.y : -INFINITY);
       local_max = max(local_max, scores[s]);
     }
     // Lane bits 1, 2 and 4 select fm: the other 28 tokens of these rows.
@@ -264,12 +290,9 @@ __attribute__((always_inline)) inline void tile(
     float2 local_sum(0.0f);
 #pragma unroll
     for (uint s = 0; s < 4; ++s) {
-      const uint token = token_start + page_token(fm, s);
       probability[s] =
-          float2(token < limit.x && token >= window_start.x
-                     ? fast::exp(scores[s].x - next_max.x) : 0.0f,
-                 token < limit.y && token >= window_start.y
-                     ? fast::exp(scores[s].y - next_max.y) : 0.0f);
+          float2(seen[s].x ? fast::exp(scores[s].x - next_max.x) : 0.0f,
+                 seen[s].y ? fast::exp(scores[s].y - next_max.y) : 0.0f);
       local_sum += probability[s];
     }
     local_sum += simd_shuffle_xor(local_sum, 2);
@@ -290,14 +313,10 @@ __attribute__((always_inline)) inline void tile(
     // P^T tile s is the score tile's own fragment: B[k = fm][n = fn].
     float2 weights[4];
 #pragma unroll
-    for (uint s = 0; s < 4; ++s) {
-      const uint token = token_start + page_token(fm, s);
+    for (uint s = 0; s < 4; ++s)
       weights[s] = float2(
-          token < limit.x && token >= window_start.x
-              ? float(bfloat(probability[s].x * value_scale[s])) : 0.0f,
-          token < limit.y && token >= window_start.y
-              ? float(bfloat(probability[s].y * value_scale[s])) : 0.0f);
-    }
+          seen[s].x ? float(bfloat(probability[s].x * value_scale[s])) : 0.0f,
+          seen[s].y ? float(bfloat(probability[s].y * value_scale[s])) : 0.0f);
 
     // O^T tile d += V^T (dimensions 8 d + fm, tokens) x P^T, each output tile
     // summing its four token steps in order. The steps are spelled out: as a
