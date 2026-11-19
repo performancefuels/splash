@@ -373,6 +373,16 @@ extension LaunchOption {
             help: "MoE expert weights kept in memory; the others are read from the SSD as needed. Auto gives them what the context leaves. All keeps every expert in memory.",
             section: .memory, kind: .choice(standard: "Auto", choices: [("off", "All")], custom: size(example: "16G"))),
         LaunchOption(
+            flag: "--expert-floor", title: "Expert cache floor",
+            help: "The least memory the expert cache keeps when the Mac runs short of memory; it grows back toward the expert cache as memory allows.",
+            section: .memory, kind: .choice(standard: "Auto", choices: [], custom: size(example: "12G"))),
+        LaunchOption(
+            flag: "--expert-ahead-readers", title: "Expert read-ahead",
+            help: "SSD reader threads that read MoE experts ahead of their use, from 1 to 32.",
+            section: .memory,
+            kind: .choice(standard: "4", choices: [],
+                          custom: Value(prompt: "4", message: "A whole number from 1 to 32.", parse: whole))),
+        LaunchOption(
             flag: "--ple-memory", title: "PLE table",
             help: "Memory for Qwen3.8-Flash-Next’s per-layer n-gram embedding table; the rest is read from the SSD. All loads the whole table, tens of GB.",
             section: .memory, kind: .choice(standard: "Auto", choices: [("off", "All")], custom: size(example: "2G"))),

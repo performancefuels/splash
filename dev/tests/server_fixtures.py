@@ -927,6 +927,8 @@ def main_args(**overrides):
             "binary": "splash",
             "ple_memory": None,
             "expert_memory": None,
+            "expert_floor": None,
+            "expert_ahead_readers": 4,
             "sparse_kv_memory": None,
             "kv_format": "int8",
             "state_format": "fp32",
